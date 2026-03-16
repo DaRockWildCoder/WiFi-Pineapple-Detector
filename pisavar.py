@@ -6,7 +6,7 @@ import time
 import argparse
 from termcolor import colored
 from argparse import RawTextHelpFormatter
-import commands
+import subprocess
 import netifaces
 from scapy.all import *
 from termcolor import colored
@@ -70,7 +70,7 @@ def air_scan(pkt):
     :param pkt:  result of sniff function
     """
     if pkt.haslayer(Dot11Beacon):
-        ssid, bssid = pkt.info, pkt.addr2
+        ssid, bssid = pkt.info.decode('utf-8', errors='ignore'), pkt.addr2
         info = "{}=*={}".format(bssid, ssid)
         if info not in info_list:
             info_list.append(info)
@@ -93,10 +93,10 @@ def pp_analysis(info_list, pp, pisavar_method):
     """
     for v in pp.keys():
         if len(pp[v]) >= 2 and v not in blacklist:
-            print colored("\033[1m[*] PineAP module activity was detected.", 'magenta', attrs=['reverse', 'blink'])
-            print "\033[1m[*] MAC Address : ", v
-            print "\033[1m[*] FakeAP count: ", len(pp[v])
- 	    log_time = time.strftime("%c")
+            print(colored("\033[1m[*] PineAP module activity was detected.", 'magenta', attrs=['reverse', 'blink']))
+            print("\033[1m[*] MAC Address : ", v)
+            print("\033[1m[*] FakeAP count: ", len(pp[v]))
+            log_time = time.strftime("%c")
             blacklist.append(v)
             if pisavar_method == "2":
                 pp_deauth(blacklist)
@@ -122,7 +122,7 @@ def pp_deauth(blacklist):
     Starts deauthentication attack for PineAP Suite.
     """
     attack_start = "[*] Attack has started for " + str(blacklist)
-    print colored(attack_start, 'red', attrs=['reverse', 'blink'])
+    print(colored(attack_start, 'red', attrs=['reverse', 'blink']))
     time.sleep(2)
     channel = 1
     for target in blacklist:
@@ -131,7 +131,7 @@ def pp_deauth(blacklist):
         deauth = RadioTap() / Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=target.lower(), addr3=target.lower()) / Dot11Deauth()
         sendp(deauth, iface=iface, count=120, inter=.2, verbose=False)
         time.sleep(1)
-    print colored("[*] Attack has completed..", 'green', attrs=['reverse', 'blink'])
+    print(colored("[*] Attack has completed..", 'green', attrs=['reverse', 'blink']))
     time.sleep(2)
 
 
@@ -142,20 +142,20 @@ if __name__ == '__main__':
     pisavar_method = args.attack_method
     os.system("reset")
     now = time.strftime("%c")
-    print banner_intro
-    print "Information about test:"
-    print "----------"*5
-    print "[*] Start time: ", now
-    print "[*] Detects PineAP module activity and starts deauthentication attack \n    (for fake access points - WiFi Pineapple Activities Detection) "
-    print "------------"*7
+    print(banner_intro)
+    print("Information about test:")
+    print("----------"*5)
+    print("[*] Start time: ", now)
+    print("[*] Detects PineAP module activity and starts deauthentication attack \n    (for fake access points - WiFi Pineapple Activities Detection) ")
+    print("------------"*7)
     while True:
-	time.sleep(10)
-	channel = 0
-	blacklist = []
-	info_list = []
-	pp = {}
-	sniff_channel_hop(iface)
-	blacklist = pp_analysis(info_list, pp, pisavar_method)
-	time.sleep(2)
-	if len(blacklist)!=0:
-	    print "--------"*5
+        time.sleep(10)
+        channel = 0
+        blacklist = []
+        info_list = []
+        pp = {}
+        sniff_channel_hop(iface)
+        blacklist = pp_analysis(info_list, pp, pisavar_method)
+        time.sleep(2)
+        if len(blacklist)!=0:
+            print("--------"*5)
