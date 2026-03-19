@@ -58,6 +58,44 @@ def load_config(config_path):
     return capture_iface, replay_iface
 
 
+def check_interface(iface):
+    """Verify that the interface exists and is in monitor mode.
+    Offer to enable monitor mode if it is not."""
+    # Check interface exists
+    result = subprocess.run(
+        ["iwconfig", iface],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(colored("[!] Interface '{}' not found.".format(iface), "red"))
+        print(colored("[!] Available wireless interfaces:", "red"))
+        subprocess.run(["iwconfig"], check=False)
+        sys.exit(1)
+
+    # Check monitor mode
+    if "Mode:Monitor" in result.stdout:
+        print(colored("[+] {} is in Monitor mode.".format(iface), "green"))
+        return
+
+    print(colored("[!] {} is NOT in Monitor mode.".format(iface), "red"))
+    answer = input(colored("[?] Enable monitor mode on {}? [y/N] ".format(iface), "cyan")).strip().lower()
+    if answer == "y":
+        print(colored("[*] Enabling monitor mode on {} ...".format(iface), "cyan"))
+        subprocess.run(["ip", "link", "set", iface, "down"], check=False)
+        subprocess.run(["iwconfig", iface, "mode", "monitor"], check=False)
+        subprocess.run(["ip", "link", "set", iface, "up"], check=False)
+        # Verify
+        verify = subprocess.run(["iwconfig", iface], capture_output=True, text=True)
+        if "Mode:Monitor" in verify.stdout:
+            print(colored("[+] {} is now in Monitor mode.".format(iface), "green"))
+        else:
+            print(colored("[!] Failed to enable monitor mode. Try manually: airmon-ng start {}".format(iface), "red"))
+            sys.exit(1)
+    else:
+        print(colored("[!] Aborted. Enable monitor mode first.", "red"))
+        sys.exit(1)
+
+
 def load_whitelist():
     if not os.path.isfile(WHITELIST_FILE):
         return []
@@ -283,6 +321,9 @@ if __name__ == "__main__":
     print()
 
     if args.mode == "1":
+        check_interface(capture_iface)
         mode_scan_whitelist(capture_iface)
     elif args.mode == "2":
+        check_interface(capture_iface)
+        check_interface(replay_iface)
         mode_replay(capture_iface, replay_iface)
