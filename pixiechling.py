@@ -416,7 +416,7 @@ def mode_replay(capture_iface, replay_iface):
             if pkt.haslayer(Dot11):
                 dot11 = pkt.getlayer(Dot11)
                 src = (dot11.addr2 or "").lower()
-                if src and src != "ff:ff:ff:ff:ff:ff":
+                if src and src != "ff:ff:ff:ff:ff:ff" and dot11.SC is not None:
                     sc_tracker[src] = (dot11.SC >> 4) & 0xFFF
 
         # Group by channel, preserving chronological order within each channel
