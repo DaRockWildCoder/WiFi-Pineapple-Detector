@@ -1,19 +1,18 @@
 # coding=utf-8
 
-# Modulles
+import os
 import sys
 import time
 import argparse
+import subprocess
+import logging
+
 from termcolor import colored
 from argparse import RawTextHelpFormatter
-import subprocess
-import netifaces
-from scapy.all import *
-from termcolor import colored
+from scapy.all import sniff
 from scapy.sendrecv import sendp
-from time import gmtime, strftime
 from scapy.layers.dot11 import Dot11, Dot11Deauth, RadioTap, Dot11Beacon, Dot11Elt
-import logging
+
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
 
@@ -46,20 +45,18 @@ Pisavar Methods =
 """
 
 parser = argparse.ArgumentParser('PiSavar', description=DESCRIPTION, formatter_class=RawTextHelpFormatter)
-parser.add_argument('-pm','--pisavar-method', required=True, dest="attack_method", type=str, help="Pisavar attack methods")
+parser.add_argument('-pm','--pisavar-method', required=True, dest="attack_method", type=str, choices=["1", "2"], help="Pisavar attack methods")
 parser.add_argument('-i', '--interface',required=True, help="Interface (Monitor Mode)", type=str)
 args = parser.parse_args()
 
 
-def logging(log):
-	with open("/var/log/pisavar.log", "a") as f:
-		f.write(str(log)+"\n")
-		f.flush()
-		f.close()
+def write_log(log):
+    with open("/var/log/pisavar.log", "a") as f:
+        f.write(str(log) + "\n")
 
 def sniff_channel_hop(iface):
     for i in range(1, 14):
-        os.system("iwconfig " + iface + " channel " + str(i))
+        subprocess.run(["iwconfig", iface, "channel", str(i)], check=False)
         sniff(iface=iface, count=4, prn=air_scan)
 
 
@@ -101,19 +98,19 @@ def pp_analysis(info_list, pp, pisavar_method):
             if pisavar_method == "2":
                 pp_deauth(blacklist)
                 log = log_time, "||", v, " - ", len(pp[v]), " - Deauth Attack"
-                logging(log)
+                write_log(log)
             elif pisavar_method == "1":
                 log = log_time, "||", v, " - ", len(pp[v])
-                logging(log)
+                write_log(log)
     time.sleep(3)
     return blacklist
 
 
 def find_channel(clist, v):
-    global channel
+    channel = 1
     for i in range(0, len(clist)):
         if clist[i].haslayer(Dot11Beacon) and clist[i].addr2 == v:
-            channel = ((clist[i][RadioTap].Channel)-2407)//5
+            channel = ((clist[i][RadioTap].ChannelFrequency) - 2407) // 5
     return channel
 
 
@@ -124,10 +121,10 @@ def pp_deauth(blacklist):
     attack_start = "[*] Attack has started for " + str(blacklist)
     print(colored(attack_start, 'red', attrs=['reverse', 'blink']))
     time.sleep(2)
-    channel = 1
     for target in blacklist:
         clist = sniff(iface=iface, count=50)
         channel = find_channel(clist, target)
+        subprocess.run(["iwconfig", iface, "channel", str(channel)], check=False)
         deauth = RadioTap() / Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=target.lower(), addr3=target.lower()) / Dot11Deauth()
         sendp(deauth, iface=iface, count=120, inter=.2, verbose=False)
         time.sleep(1)
@@ -140,7 +137,7 @@ if __name__ == '__main__':
     iface = args.interface
     mode  = "Monitor"
     pisavar_method = args.attack_method
-    os.system("reset")
+    subprocess.run(["reset"], check=False)
     now = time.strftime("%c")
     print(banner_intro)
     print("Information about test:")
@@ -148,14 +145,13 @@ if __name__ == '__main__':
     print("[*] Start time: ", now)
     print("[*] Detects PineAP module activity and starts deauthentication attack \n    (for fake access points - WiFi Pineapple Activities Detection) ")
     print("------------"*7)
+    blacklist = []
     while True:
         time.sleep(10)
-        channel = 0
-        blacklist = []
         info_list = []
         pp = {}
         sniff_channel_hop(iface)
         blacklist = pp_analysis(info_list, pp, pisavar_method)
         time.sleep(2)
-        if len(blacklist)!=0:
+        if len(blacklist) != 0:
             print("--------"*5)
