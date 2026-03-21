@@ -149,20 +149,28 @@ def scan_bssids(capture_iface, scan_time=30, use_5ghz=False):
                 ssid = "<hidden>"
             if bssid not in discovered:
                 discovered[bssid] = {"ssid": ssid, "channel": current_ch[0]}
+                print(colored("    [+] New AP: {} ({}) on ch {}".format(
+                    bssid, ssid, current_ch[0]), "green"))
 
     per_channel = max(1, scan_time / len(channels))
     band = "2.4 GHz + 5 GHz" if use_5ghz else "2.4 GHz"
-    print(colored("[*] Scanning BSSIDs on {} ({} ch, {} s) ...".format(band, len(channels), scan_time), "cyan"))
-    for ch in channels:
+    total_ch = len(channels)
+    print(colored("[*] Scanning BSSIDs on {} ({} ch, {} s) ...".format(band, total_ch, scan_time), "cyan"))
+    for i, ch in enumerate(channels, start=1):
         current_ch[0] = ch
-        subprocess.run(
+        print(colored("    [ch {}/{}] Scanning channel {} ...".format(i, total_ch, ch), "white"), end="\r")
+        ret = subprocess.run(
             ["iwconfig", capture_iface, "channel", str(ch)],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        if ret.returncode != 0:
+            print(colored("    [ch {}/{}] Channel {} — skipped (unsupported)".format(i, total_ch, ch), "yellow"))
+            continue
         sniff(iface=capture_iface, count=10, timeout=per_channel, prn=_handle_beacon)
 
+    print(colored("[*] Scan complete: {} AP(s) discovered.".format(len(discovered)), "cyan"))
     return discovered
 
 
