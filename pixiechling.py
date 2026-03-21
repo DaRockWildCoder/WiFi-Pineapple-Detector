@@ -160,7 +160,7 @@ def scan_bssids(capture_iface, scan_time=30, use_5ghz=False):
         current_ch[0] = ch
         print(colored("    [ch {}/{}] Scanning channel {} ...".format(i, total_ch, ch), "white"), end="\r")
         ret = subprocess.run(
-            ["iwconfig", capture_iface, "channel", str(ch)],
+            ["iw", "dev", capture_iface, "set", "channel", str(ch)],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -348,7 +348,7 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
                     return
                 current_channel[0] = ch
                 subprocess.run(
-                    ["iwconfig", capture_iface, "channel", str(ch)],
+                    ["iw", "dev", capture_iface, "set", "channel", str(ch)],
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -477,7 +477,7 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
             if stop_event.is_set():
                 break
             subprocess.run(
-                ["iwconfig", replay_iface, "channel", str(ch)],
+                ["iw", "dev", replay_iface, "set", "channel", str(ch)],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -765,7 +765,7 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                     return
                 current_channel[0] = ch
                 subprocess.run(
-                    ["iwconfig", capture_iface, "channel", str(ch)],
+                    ["iw", "dev", capture_iface, "set", "channel", str(ch)],
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
