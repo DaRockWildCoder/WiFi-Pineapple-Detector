@@ -155,7 +155,12 @@ def scan_bssids(capture_iface, scan_time=30, use_5ghz=False):
     print(colored("[*] Scanning BSSIDs on {} ({} ch, {} s) ...".format(band, len(channels), scan_time), "cyan"))
     for ch in channels:
         current_ch[0] = ch
-        subprocess.run(["iwconfig", capture_iface, "channel", str(ch)], check=False)
+        subprocess.run(
+            ["iwconfig", capture_iface, "channel", str(ch)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
         sniff(iface=capture_iface, count=10, timeout=per_channel, prn=_handle_beacon)
 
     return discovered
