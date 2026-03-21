@@ -38,6 +38,7 @@ CONFIG_FILE = "pixiechling.conf"
 
 CHANNELS_24 = list(range(1, 14))
 CHANNELS_5 = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165]
+RELAY_FILE = "pixiechling_relays.json"
 
 DESCRIPTION = """
 Pixiechling - WiFi Traffic Capture & Replay Tool
@@ -124,8 +125,9 @@ def save_whitelist(whitelist):
 #  Mode 1 : Scan & whitelist selection
 # ──────────────────────────────────────────────
 
-def scan_bssids(capture_iface, scan_time=30):
-    """Scan channels 1-13 and collect unique BSSIDs with their SSIDs."""
+def scan_bssids(capture_iface, scan_time=30, use_5ghz=False):
+    """Scan channels and collect unique BSSIDs with their SSIDs."""
+    channels = CHANNELS_24 + CHANNELS_5 if use_5ghz else CHANNELS_24
     discovered = {}
 
     def _handle_beacon(pkt):
@@ -140,18 +142,19 @@ def scan_bssids(capture_iface, scan_time=30):
             if bssid not in discovered:
                 discovered[bssid] = ssid
 
-    per_channel = max(1, scan_time / 13)
-    print(colored("[*] Scanning BSSIDs on all channels ({} s) ...".format(scan_time), "cyan"))
-    for ch in range(1, 14):
+    per_channel = max(1, scan_time / len(channels))
+    band = "2.4 GHz + 5 GHz" if use_5ghz else "2.4 GHz"
+    print(colored("[*] Scanning BSSIDs on {} ({} ch, {} s) ...".format(band, len(channels), scan_time), "cyan"))
+    for ch in channels:
         subprocess.run(["iwconfig", capture_iface, "channel", str(ch)], check=False)
         sniff(iface=capture_iface, count=10, timeout=per_channel, prn=_handle_beacon)
 
     return discovered
 
 
-def mode_scan_whitelist(capture_iface, scan_time=30):
+def mode_scan_whitelist(capture_iface, scan_time=30, use_5ghz=False):
     """Interactive mode: display BSSIDs, let user pick whitelist entries."""
-    discovered = scan_bssids(capture_iface, scan_time)
+    discovered = scan_bssids(capture_iface, scan_time, use_5ghz)
 
     if not discovered:
         print(colored("[!] No BSSIDs found. Make sure the interface is in monitor mode.", "red"))
@@ -518,6 +521,10 @@ def mode_rogue_detect(capture_iface):
     alerted_clone = set()   # (bssid, channel)
     # Track first-seen channel per BSSID for clone detection
     bssid_channels = {}     # bssid -> first_seen_channel
+    # Relay/repeater tracking
+    beacon_bssids = {}      # bssid -> ssid (all BSSIDs seen in beacons)
+    relays = {}             # relay_bssid -> {upstream_bssid: upstream_ssid}
+    alerted_relay = set()   # (relay_bssid, upstream_bssid)
     lock = threading.Lock()
     stop_event = threading.Event()
 
@@ -532,73 +539,141 @@ def mode_rogue_detect(capture_iface):
         print("    {} ({})".format(b, s))
     print(colored("[*] Protected SSIDs: {}".format(
         ", ".join(s for s in wl_ssids.keys() if s != "<unknown>")), "cyan"))
-    print(colored("[*] Monitoring for rogue APs (Ctrl+C to stop) ...", "cyan"))
+    print(colored("[*] Monitoring for rogue APs + signal relays (Ctrl+C to stop) ...", "cyan"))
     print()
 
     current_channel = [1]
 
-    def _handle_beacon(pkt):
+    def _save_relays():
+        """Save detected relay network to JSON file."""
+        data = {}
+        for r_bssid, upstreams in relays.items():
+            data[r_bssid] = {
+                "ssid": beacon_bssids.get(r_bssid, "<unknown>"),
+                "upstream": dict(upstreams),
+            }
+        with open(RELAY_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def _handle_pkt(pkt):
         if stop_event.is_set():
             return
-        if not pkt.haslayer(Dot11Beacon):
-            return
 
-        bssid = (pkt.addr2 or "").lower()
-        if not bssid:
-            return
-        try:
-            ssid = pkt.info.decode("utf-8", errors="ignore") or ""
-        except Exception:
-            ssid = ""
+        # ── Beacon processing: SSID spoofing, BSSID cloning, BSSID tracking ──
+        if pkt.haslayer(Dot11Beacon):
+            bssid = (pkt.addr2 or "").lower()
+            if not bssid:
+                return
+            try:
+                ssid = pkt.info.decode("utf-8", errors="ignore") or ""
+            except Exception:
+                ssid = ""
 
-        ssid_lower = ssid.lower()
-        ch = current_channel[0]
+            ssid_lower = ssid.lower()
+            ch = current_channel[0]
 
-        with lock:
-            # ── Check 1: SSID spoofing ──
-            # Another BSSID is using the same SSID as one of our whitelisted APs
-            if ssid_lower in wl_ssids and bssid not in wl_bssids:
-                alert_key = (bssid, ssid_lower)
-                if alert_key not in alerted_spoof:
-                    alerted_spoof.add(alert_key)
-                    legit = ", ".join(wl_ssids[ssid_lower])
-                    print(colored(
-                        "\n  [!!!] SSID SPOOFING DETECTED", "red", attrs=["bold", "reverse"]))
-                    print(colored(
-                        "        Rogue BSSID : {}".format(bssid), "red", attrs=["bold"]))
-                    print(colored(
-                        "        Spoofed SSID: {}".format(ssid), "red", attrs=["bold"]))
-                    print(colored(
-                        "        Legit BSSID : {}".format(legit), "green"))
-                    print(colored(
-                        "        Channel     : {}".format(ch), "yellow"))
-                    print(colored(
-                        "        Time        : {}".format(time.strftime("%c")), "yellow"))
-                    print()
+            with lock:
+                # Track all beacon BSSIDs for relay detection
+                if bssid not in beacon_bssids:
+                    beacon_bssids[bssid] = ssid or "<hidden>"
 
-            # ── Check 2: BSSID cloning ──
-            # Same BSSID seen on a different channel (possible evil twin)
-            if bssid in wl_bssids:
-                if bssid not in bssid_channels:
-                    bssid_channels[bssid] = ch
-                elif bssid_channels[bssid] != ch:
-                    alert_key = (bssid, ch)
-                    if alert_key not in alerted_clone:
-                        alerted_clone.add(alert_key)
-                        expected_ch = bssid_channels[bssid]
+                # ── Check 1: SSID spoofing ──
+                if ssid_lower in wl_ssids and bssid not in wl_bssids:
+                    alert_key = (bssid, ssid_lower)
+                    if alert_key not in alerted_spoof:
+                        alerted_spoof.add(alert_key)
+                        legit = ", ".join(wl_ssids[ssid_lower])
                         print(colored(
-                            "\n  [!!!] BSSID CLONE / EVIL TWIN DETECTED", "red", attrs=["bold", "reverse"]))
+                            "\n  [!!!] SSID SPOOFING DETECTED", "red", attrs=["bold", "reverse"]))
                         print(colored(
-                            "        BSSID       : {}".format(bssid), "red", attrs=["bold"]))
+                            "        Rogue BSSID : {}".format(bssid), "red", attrs=["bold"]))
                         print(colored(
-                            "        SSID        : {}".format(ssid), "red", attrs=["bold"]))
+                            "        Spoofed SSID: {}".format(ssid), "red", attrs=["bold"]))
                         print(colored(
-                            "        Expected ch : {}".format(expected_ch), "green"))
+                            "        Legit BSSID : {}".format(legit), "green"))
                         print(colored(
-                            "        Seen on ch  : {}".format(ch), "red", attrs=["bold"]))
+                            "        Channel     : {}".format(ch), "yellow"))
                         print(colored(
                             "        Time        : {}".format(time.strftime("%c")), "yellow"))
                         print()
+
+                # ── Check 2: BSSID cloning ──
+                if bssid in wl_bssids:
+                    if bssid not in bssid_channels:
+                        bssid_channels[bssid] = ch
+                    elif bssid_channels[bssid] != ch:
+                        alert_key = (bssid, ch)
+                        if alert_key not in alerted_clone:
+                            alerted_clone.add(alert_key)
+                            expected_ch = bssid_channels[bssid]
+                            print(colored(
+                                "\n  [!!!] BSSID CLONE / EVIL TWIN DETECTED", "red", attrs=["bold", "reverse"]))
+                            print(colored(
+                                "        BSSID       : {}".format(bssid), "red", attrs=["bold"]))
+                            print(colored(
+                                "        SSID        : {}".format(ssid), "red", attrs=["bold"]))
+                            print(colored(
+                                "        Expected ch : {}".format(expected_ch), "green"))
+                            print(colored(
+                                "        Seen on ch  : {}".format(ch), "red", attrs=["bold"]))
+                            print(colored(
+                                "        Time        : {}".format(time.strftime("%c")), "yellow"))
+                            print()
+
+        # ── Data frame processing: relay/repeater detection ──
+        if pkt.haslayer(Dot11):
+            dot11 = pkt.getlayer(Dot11)
+            if dot11.type == 2:  # Data frame
+                addr1 = (dot11.addr1 or "").lower()
+                addr2 = (dot11.addr2 or "").lower()
+                ds_bits = dot11.FCfield & 0x3
+
+                with lock:
+                    relay_bssid = None
+                    upstream_bssid = None
+
+                    # ToDS: addr1=BSSID(AP), addr2=SA(client)
+                    # If addr2 is a known AP acting as client → relay
+                    if ds_bits == 0x1:
+                        if (addr2 in beacon_bssids and addr1 in beacon_bssids
+                                and addr2 != addr1):
+                            relay_bssid = addr2
+                            upstream_bssid = addr1
+                    # WDS (ToDS+FromDS): addr2=TA, addr1=RA — direct relay evidence
+                    elif ds_bits == 0x3:
+                        if (addr2 in beacon_bssids and addr1 in beacon_bssids
+                                and addr2 != addr1):
+                            relay_bssid = addr2
+                            upstream_bssid = addr1
+
+                    if relay_bssid and upstream_bssid:
+                        alert_key = (relay_bssid, upstream_bssid)
+                        if alert_key not in alerted_relay:
+                            alerted_relay.add(alert_key)
+                            if relay_bssid not in relays:
+                                relays[relay_bssid] = {}
+                            relays[relay_bssid][upstream_bssid] = beacon_bssids.get(
+                                upstream_bssid, "<unknown>")
+
+                            r_ssid = beacon_bssids.get(relay_bssid, "<unknown>")
+                            u_ssid = beacon_bssids.get(upstream_bssid, "<unknown>")
+                            print(colored(
+                                "\n  [!!!] SIGNAL RELAY / REPEATER DETECTED",
+                                "magenta", attrs=["bold", "reverse"]))
+                            print(colored(
+                                "        Relay BSSID   : {} ({})".format(
+                                    relay_bssid, r_ssid), "magenta", attrs=["bold"]))
+                            print(colored(
+                                "        Upstream BSSID: {} ({})".format(
+                                    upstream_bssid, u_ssid), "cyan", attrs=["bold"]))
+                            print(colored(
+                                "        Channel       : {}".format(
+                                    current_channel[0]), "yellow"))
+                            print(colored(
+                                "        Time          : {}".format(
+                                    time.strftime("%c")), "yellow"))
+                            print()
+                            _save_relays()
 
     # ── Capture thread ──
     def capture_loop():
@@ -613,7 +688,7 @@ def mode_rogue_detect(capture_iface):
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                sniff(iface=capture_iface, timeout=2, prn=_handle_beacon)
+                sniff(iface=capture_iface, timeout=2, prn=_handle_pkt)
 
     cap_thread = threading.Thread(target=capture_loop, daemon=True)
     cap_thread.start()
@@ -624,11 +699,23 @@ def mode_rogue_detect(capture_iface):
         with lock:
             spoof_count = len(alerted_spoof)
             clone_count = len(alerted_clone)
+            relay_count = len(alerted_relay)
+            relay_snapshot = {r: dict(u) for r, u in relays.items()}
+            bssid_names = dict(beacon_bssids)
+        total_alerts = spoof_count + clone_count + relay_count
         print(colored(
-            "[*] Status: {} SSID spoof(s), {} BSSID clone(s) detected so far".format(
-                spoof_count, clone_count),
-            "yellow" if (spoof_count + clone_count) == 0 else "red",
+            "\n[*] Status: {} SSID spoof(s), {} BSSID clone(s), {} relay(s) detected".format(
+                spoof_count, clone_count, relay_count),
+            "yellow" if total_alerts == 0 else "red",
         ))
+        if relay_snapshot:
+            print(colored("  Relay network map:", "magenta", attrs=["bold"]))
+            for r_bssid, upstreams in sorted(relay_snapshot.items()):
+                r_ssid = bssid_names.get(r_bssid, "<unknown>")
+                for u_bssid, u_ssid in sorted(upstreams.items()):
+                    print(colored(
+                        "    {} ({})  \u2192  {} ({})".format(
+                            r_bssid, r_ssid, u_bssid, u_ssid), "magenta"))
 
     cap_thread.join(timeout=5)
     print(colored("[*] Pixiechling stopped.", "yellow"))
@@ -681,7 +768,7 @@ if __name__ == "__main__":
 
     if args.mode == "1":
         check_interface(capture_iface)
-        mode_scan_whitelist(capture_iface, args.scan_time)
+        mode_scan_whitelist(capture_iface, args.scan_time, args.use_5ghz)
     elif args.mode == "2":
         check_interface(capture_iface)
         check_interface(replay_iface)
