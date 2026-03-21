@@ -40,6 +40,17 @@ CHANNELS_24 = list(range(1, 14))
 CHANNELS_5 = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165]
 RELAY_FILE = "pixiechling_relays.json"
 
+def get_ds_channel(pkt):
+    """Extract the real operating channel from the beacon's DS Parameter Set (IE id=3).
+    Returns the channel as int, or None if not found."""
+    elt = pkt.getlayer(Dot11Elt)
+    while elt:
+        if elt.ID == 3 and elt.info and len(elt.info) >= 1:
+            return elt.info[0]
+        elt = elt.payload.getlayer(Dot11Elt)
+    return None
+
+
 DESCRIPTION = """
 Pixiechling - WiFi Traffic Capture & Replay Tool
 
@@ -147,10 +158,11 @@ def scan_bssids(capture_iface, scan_time=30, use_5ghz=False):
                 ssid = "<hidden>"
             if not ssid:
                 ssid = "<hidden>"
+            real_ch = get_ds_channel(pkt) or current_ch[0]
             if bssid not in discovered:
-                discovered[bssid] = {"ssid": ssid, "channel": current_ch[0]}
+                discovered[bssid] = {"ssid": ssid, "channel": real_ch}
                 print(colored("    [+] New AP: {} ({}) on ch {}".format(
-                    bssid, ssid, current_ch[0]), "green"))
+                    bssid, ssid, real_ch), "green"))
 
     per_channel = max(1, scan_time / len(channels))
     band = "2.4 GHz + 5 GHz" if use_5ghz else "2.4 GHz"
@@ -608,7 +620,7 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                 ssid = ""
 
             ssid_lower = ssid.lower()
-            ch = current_channel[0]
+            ch = get_ds_channel(pkt) or current_channel[0]
 
             with lock:
                 # Track all beacon BSSIDs for relay detection
