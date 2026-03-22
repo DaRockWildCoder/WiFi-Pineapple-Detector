@@ -305,7 +305,7 @@ Injects whispered voices into Bluetooth audio. Supports **SCO** (voice profile) 
 **Steps:**
 1. **Generate** *(optional)* — If `-f` is provided (or default `whispers.txt` used), generates WAV files using `espeak-ng`/`espeak` with the `+whisper` voice variant
 2. **Load** — Reads `.wav` files, resamples to 8 kHz 16-bit mono (SCO CVSD)
-3. **Discover** — Scans for non-whitelisted devices (classic + BLE)
+3. **Discover** — Scans for all available Bluetooth devices (classic + BLE)
 4. **Select** — Interactive selection: **1 target** (direct) or **2 targets** (MITM)
 5. **Disconnect** — Force-disconnects target(s)
 6. **Pair** — `bluetoothctl trust` + `pair`
@@ -354,7 +354,6 @@ Injects whispered voices into Bluetooth audio. Supports **SCO** (voice profile) 
 [*] Relay: 4820 pkt(s) | Injections: 37 | A→B: 2400/18 | B→A: 2420/19
 ```
 
-> ⚠️ **Whitelist required**: Run mode 1 first.
 > ⚠️ **1 adapter minimum** (direct injection / A2DP playback). 2nd adapter optional for MITM relay (`-o`).
 > ⚠️ **Whisper source** : `.wav` files (`-w`) **or** text file (`-f`) **or** default `whispers.txt`.
 > ⚠️ **A2DP devices** (TV, speakers, headphones): SCO is attempted first; if it fails, the tool automatically falls back to A2DP playback via PulseAudio/PipeWire.

