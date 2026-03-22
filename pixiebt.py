@@ -573,8 +573,42 @@ def mode_monitor(iface, include_ble=True):
             return False  # no peers → any connection is suspicious
         return intruder_mac.upper() in {m.upper() for m in allowed}
 
+    # Nearby devices seen by passive scans (info only, no counter-offensive)
+    nearby_devices = {}  # mac -> {"name", "type", "first_seen", "count"}
+    nearby_lock = threading.Lock()
+
+    def _log_nearby(mac, name, dev_type, source):
+        """Log a nearby device detected by passive scan. Info only."""
+        mac_u = mac.upper()
+        if mac_u in my_devices or mac_u in all_known_macs:
+            return
+        with nearby_lock:
+            if mac_u in nearby_devices:
+                nearby_devices[mac_u]["count"] += 1
+                return
+            nearby_devices[mac_u] = {
+                "name": name,
+                "type": dev_type,
+                "first_seen": time.time(),
+                "count": 1,
+            }
+        print(colored(
+            "\n  [i] NEARBY DEVICE DETECTED",
+            "yellow", attrs=["bold"]))
+        print(colored(
+            "      MAC  : {}".format(mac_u), "yellow"))
+        print(colored(
+            "      Name : {}".format(name), "yellow"))
+        print(colored(
+            "      Type : {}".format(dev_type), "white"))
+        print(colored(
+            "      Via  : {}".format(source), "white"))
+        print(colored(
+            "      Time : {}".format(time.strftime("%c")), "white"))
+        print()
+
     def _alert_intruder(mac, name, dev_type, source, target_device=None):
-        """Register a new intruder and print alert."""
+        """Register an intruder attempting to connect and engage counter-offensive."""
         with intruder_lock:
             if mac in detected_intruders:
                 detected_intruders[mac]["count"] += 1
@@ -612,16 +646,6 @@ def mode_monitor(iface, include_ble=True):
         print()
         return True
 
-    def _check_intruder(mac, name, dev_type, source):
-        """Check if a discovered device is an unauthorized peer of any of our devices."""
-        mac_u = mac.upper()
-        if mac_u in my_devices:
-            return  # it's one of our own devices
-        if mac_u in all_known_macs:
-            return  # it's an allowed peer of one of our devices
-        # Unknown MAC — check if it could be connecting to any of our devices
-        _alert_intruder(mac_u, name, dev_type, source)
-
     # ── Thread 1: Classic BT inquiry scan ──
     def classic_scan_loop():
         use_hcitool = shutil.which("hcitool") is not None
@@ -639,11 +663,11 @@ def mode_monitor(iface, include_ble=True):
                         if match:
                             mac = match.group(1).upper()
                             name = match.group(2).strip() or "<unknown>"
-                            _check_intruder(mac, name, "classic", "inquiry scan")
+                            _log_nearby(mac, name, "classic", "inquiry scan")
                 else:
                     devs = _btctl_scan(8, quiet=True)
                     for mac, info in devs.items():
-                        _check_intruder(mac, info["name"], "classic", "bluetoothctl scan")
+                        _log_nearby(mac, info["name"], "classic", "bluetoothctl scan")
                 stats["classic_scans"] += 1
             except subprocess.TimeoutExpired:
                 pass
@@ -680,11 +704,11 @@ def mode_monitor(iface, include_ble=True):
                             name = match.group(2).strip()
                             if name in ("(unknown)", ""):
                                 name = "<unknown>"
-                            _check_intruder(mac, name, "ble", "BLE scan")
+                            _log_nearby(mac, name, "ble", "BLE scan")
                 else:
                     devs = _btctl_scan(8, quiet=True)
                     for mac, info in devs.items():
-                        _check_intruder(mac, info["name"], "ble", "bluetoothctl BLE scan")
+                        _log_nearby(mac, info["name"], "ble", "bluetoothctl BLE scan")
                 stats["ble_scans"] += 1
             except Exception:
                 pass
@@ -834,11 +858,14 @@ def mode_monitor(iface, include_ble=True):
 
         n_floods = len([m for m, p in active_floods.items() if p.poll() is None])
 
+        with nearby_lock:
+            n_nearby = len(nearby_devices)
+
         color = "yellow" if n_intruders == 0 else "red"
         print(colored(
-            "\n[*] Status: {} intruder(s) detected | {} active flood(s) | "
+            "\n[*] Status: {} intruder(s) | {} nearby device(s) | {} active flood(s) | "
             "scans: {} classic, {} BLE, {} conn checks".format(
-                n_intruders, n_floods,
+                n_intruders, n_nearby, n_floods,
                 stats["classic_scans"], stats["ble_scans"],
                 stats["connection_checks"]),
             color))
@@ -855,6 +882,8 @@ def mode_monitor(iface, include_ble=True):
                 print("    {} ({}) [{}] — seen {}x via {}{}".format(
                     mac, info["name"], info["type"],
                     info["count"], info["source"], flood_status))
+        elif n_nearby:
+            print(colored("[*] {} nearby device(s) (passive, no counter-offensive).".format(n_nearby), "yellow"))
         else:
             print(colored("[*] All clear — no unauthorized devices.", "green"))
 
