@@ -1845,62 +1845,11 @@ def mode_whisper(iface, iface2, whispers_dir, whisper_volume=0.15, include_ble=T
         sys.exit(1)
     print(colored("[+] Loaded {} whisper file(s)\n".format(len(whispers)), "green"))
 
-    # Step 2: Discover all available Bluetooth devices
-    has_hcitool = shutil.which("hcitool") is not None
+    # Step 2: Discover all available Bluetooth devices (same scan as mode 1)
     print(colored("[*] Scanning for available Bluetooth devices ...", "cyan"))
-    targets = {}
-    if has_hcitool:
-        try:
-            ret = subprocess.run(
-                ["hcitool", "-i", iface, "scan", "--flush", "--length", "6"],
-                capture_output=True, text=True, timeout=20,
-            )
-            for line in ret.stdout.strip().split("\n"):
-                m = re.match(r"([0-9A-Fa-f:]{17})\s+(.*)", line.strip())
-                if m:
-                    mac = m.group(1).upper()
-                    name = m.group(2).strip() or "<unknown>"
-                    targets[mac] = {"name": name, "type": "classic"}
-        except Exception:
-            pass
-        if include_ble:
-            try:
-                proc = subprocess.Popen(
-                    ["hcitool", "-i", iface, "lescan", "--duplicates"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                )
-                time.sleep(8)
-                proc.terminate()
-                try:
-                    rem, _ = proc.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                    rem = ""
-                for line in (rem or "").strip().split("\n"):
-                    m = re.match(r"([0-9A-Fa-f:]{17})\s+(.*)", line.strip())
-                    if m:
-                        mac = m.group(1).upper()
-                        name = m.group(2).strip()
-                        if name in ("(unknown)", ""):
-                            name = "<unknown>"
-                        if mac not in targets:
-                            targets[mac] = {"name": name, "type": "ble"}
-            except Exception:
-                pass
-    else:
-        devs = _btctl_scan(10)
-        for mac, info in devs.items():
-            targets[mac] = info
+    targets = scan_all(iface, scan_time=10, include_ble=include_ble)
 
-    # Fallback: if hcitool found nothing, try bluetoothctl
-    if not targets and has_hcitool:
-        print(colored("[*] hcitool returned no results, trying bluetoothctl ...", "yellow"))
-        devs = _btctl_scan(10)
-        for mac, info in devs.items():
-            targets[mac] = info
-
-    if len(targets) < 1:
+    if not targets:
         print(colored("[!] No Bluetooth devices found.", "red"))
         sys.exit(1)
 
