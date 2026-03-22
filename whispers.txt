@@ -1,0 +1,21 @@
+# PixieBT Mode 4 — Whisper injection word list
+# One word or phrase per line — each line generates a whispered .wav via espeak
+# Lines starting with # are ignored
+# Use -l fr for French, -l en for English (default), etc.
+
+# English
+help me
+behind you
+run away
+do you hear that
+who is there
+
+# French (use with: --whisper-lang fr)
+# aide moi
+# derrière toi
+# cours vite
+# tu entends ça
+# qui est là
+# regarde autour de toi
+# ils nous observent
+# écoute bien

@@ -26,6 +26,7 @@ Key concept: a **two-level whitelist** defines which devices are yours, and whic
   - [Mode 1 — Scan & Whitelist](#mode-1--scan--whitelist)
   - [Mode 2 — Monitor & Counter-Offensive](#mode-2--monitor--counter-offensive)
   - [Mode 3 — Capture & Replay](#mode-3--capture--replay)
+  - [Mode 4 — Audio MITM (Whisper Injection)](#mode-4--audio-mitm-whisper-injection)
 - [CLI Options](#cli-options)
 - [Generated Files](#generated-files)
 - [Examples](#examples)
@@ -59,9 +60,14 @@ pip3 install termcolor
 | `hcidump` | `bluez` | HCI traffic capture (fallback for btmon) |
 | `hcireplay` | `bluez` | HCI replay (optional, preferred for mode 3) |
 
+**Mode 4 additionally requires:**
+- A **second Bluetooth adapter** (e.g. `hci1`) — *only for MITM relay mode*
+- `.wav` whisper files in a directory **OR** a text file + `espeak-ng` / `espeak` for automatic generation
+- **A2DP playback** (TV/speakers): `pulseaudio` or `pipewire-pulse` + one of `paplay`, `pw-play`, `aplay`
+
 ```bash
 # Debian/Ubuntu
-sudo apt install bluez
+sudo apt install bluez espeak-ng pulseaudio-utils
 
 # Arch
 sudo pacman -S bluez bluez-utils
@@ -276,19 +282,105 @@ sudo python3 pixiebt.py -m 3 -r 20    # replay 20x instead of 10
 
 ---
 
+### Mode 4 — Audio MITM (Whisper Injection)
+
+Injects whispered voices into Bluetooth audio. Supports **SCO** (voice profile) and **A2DP** (media profile) devices.
+
+**Three sub-modes** (selected interactively after scanning):
+
+| Sub-mode | Profile | Adapters | Selection | Description |
+|----------|---------|----------|-----------|-------------|
+| **Direct injection (SCO)** | HFP/HSP | 1 | 1 target | Connect via SCO and inject whispers on multi-source detection |
+| **Direct playback (A2DP)** | A2DP | 1 | 1 target | Connect to TV/speaker/headphones and play whispers via PulseAudio/PipeWire |
+| **MITM relay** | HFP/HSP | 2 | 2 targets | Intercept audio between device A ↔ B and inject whispers in both directions |
+
+> With a single adapter, only direct injection is available. With `-o`, the user can choose either.
+> A2DP mode is **automatic** — if SCO fails (TV, speakers, headphones in media mode), the tool falls back to A2DP playback.
+
+**Detection heuristic** (3-signal analysis):
+1. **Energy floor** — RMS energy > 500 (audio is not silence)
+2. **Zero-crossing rate** — ZCR in [0.05, 0.40] (not pure tone / not pure noise)
+3. **Energy variance** — Coefficient of variation > 15% across 4 sub-windows (dynamic multi-source scene)
+
+**Steps:**
+1. **Generate** *(optional)* — If `-f` is provided (or default `whispers.txt` used), generates WAV files using `espeak-ng`/`espeak` with the `+whisper` voice variant
+2. **Load** — Reads `.wav` files, resamples to 8 kHz 16-bit mono (SCO CVSD)
+3. **Discover** — Scans for non-whitelisted devices (classic + BLE)
+4. **Select** — Interactive selection: **1 target** (direct) or **2 targets** (MITM)
+5. **Disconnect** — Force-disconnects target(s)
+6. **Pair** — `bluetoothctl trust` + `pair`
+7. **Connect** — Tries SCO socket first; if SCO fails, falls back to A2DP via `bluetoothctl connect` + PulseAudio/PipeWire sink detection
+8. **Inject / Relay / Playback** — SCO: listen + inject. MITM: relay A→B / B→A. A2DP: play WAVs via `paplay`/`pw-play`/`aplay`
+9. **Detect** — SCO modes: whisper PCM mixed on `_detect_multi_source()` trigger. A2DP: whispers played sequentially with random pauses
+
+**Alert examples:**
+
+*Single target (SCO — voice devices):*
+```
+[*] Target: AA:BB:CC:DD:EE:01 (SomeHeadphones)
+[*] Trying SCO connection (voice profile) ...
+    [+] SCO → AA:BB:CC:DD:EE:01 (SomeHeadphones)
+[*] Mode  : SCO direct injection
+
+[+] Direct injection active — whispers sent on multi-source detection
+[*] Packets: 2410 | Injections: 18
+```
+
+*Single target (A2DP fallback — TV, speakers, headphones):*
+```
+[*] Target: AA:BB:CC:DD:EE:02 (LivingRoom-TV)
+[*] Trying SCO connection (voice profile) ...
+[*] SCO not available — switching to A2DP sink mode (TV/speaker/headphones)
+[*] Connecting via A2DP ...
+    [+] A2DP → AA:BB:CC:DD:EE:02 (LivingRoom-TV)
+[*] Mode  : A2DP playback (whispers played on device)
+
+[+] A2DP injection active — whispers played directly on target
+[*] Whispers played: 12
+```
+
+*Dual target (MITM relay):*
+```
+  [1 target]  Direct injection (whisper sent to device)
+  [2 targets] MITM relay (intercept audio between A ↔ B)
+
+[?] Select target(s) — comma-separated (e.g. 1 or 1,2): 1,2
+
+[*] Target A: AA:BB:CC:DD:EE:01 (SomeHeadphones)
+[*] Target B: AA:BB:CC:DD:EE:02 (SmartSpeaker)
+[*] Mode    : MITM relay
+
+[+] MITM relay active — whispers injected on multi-source detection
+[*] Relay: 4820 pkt(s) | Injections: 37 | A→B: 2400/18 | B→A: 2420/19
+```
+
+> ⚠️ **Whitelist required**: Run mode 1 first.
+> ⚠️ **1 adapter minimum** (direct injection / A2DP playback). 2nd adapter optional for MITM relay (`-o`).
+> ⚠️ **Whisper source** : `.wav` files (`-w`) **or** text file (`-f`) **or** default `whispers.txt`.
+> ⚠️ **A2DP devices** (TV, speakers, headphones): SCO is attempted first; if it fails, the tool automatically falls back to A2DP playback via PulseAudio/PipeWire.
+
+---
+
 ## CLI Options
 
 ```
-usage: PixieBT [-h] -m {1,2,3} [-c CONFIG] [-t SCAN_TIME] [-r REPLAY_COUNT] [--no-ble]
+usage: PixieBT [-h] -m {1,2,3,4} [-c CONFIG] [-t SCAN_TIME] [-r REPLAY_COUNT]
+               [--no-ble] [-o HCI] [-w DIR] [-f FILE]
+               [--whisper-volume VOL] [-l LANG]
 ```
 
 | Option | Long | Description | Default | Modes |
 |--------|------|-------------|---------|-------|
-| `-m` | `--mode` | Execution mode (1, 2 or 3) | *required* | all |
+| `-m` | `--mode` | Execution mode (1, 2, 3 or 4) | *required* | all |
 | `-c` | `--config` | Path to configuration file | `pixiebt.conf` | all |
 | `-t` | `--scan-time` | Scan duration in seconds | `10` | 1 |
 | `-r` | `--replay-count` | Number of times to replay captured traffic | `10` | 3 |
-| | `--no-ble` | Disable BLE scanning (Classic BT only) | `false` | 1, 2, 3 |
+| | `--no-ble` | Disable BLE scanning (Classic BT only) | `false` | all |
+| `-o` | | Second BT adapter for MITM relay (optional) | — | 4 |
+| `-w` | `--whispers-dir` | Directory containing `.wav` whisper files | — | 4 |
+| `-f` | `--f` | Text file (word/phrase per line) for auto TTS generation via espeak | — | 4 |
+| | `--whisper-volume` | Whisper injection volume (0.0–1.0) | `0.15` | 4 |
+| `-l` | `--whisper-lang` | Espeak language code for TTS (`en`, `fr`, `de`, `es`, `it`, `ru`, ...) | `en` | 4 |
 
 ---
 
@@ -357,6 +449,30 @@ sudo python3 pixiebt.py -m 3 --no-ble
 
 # With a custom config file
 sudo python3 pixiebt.py -m 2 -c /etc/pixiebt/custom.conf
+
+# Audio MITM with whisper injection (2 adapters required)
+sudo python3 pixiebt.py -m 4 -o hci1 -w /home/user/whispers/
+
+# Single-target direct injection (1 adapter, uses default whispers.txt)
+sudo python3 pixiebt.py -m 4
+
+# Audio MITM with louder whispers (25% volume)
+sudo python3 pixiebt.py -m 4 -o hci1 -w ./whispers/ --whisper-volume 0.25
+
+# Audio MITM, classic BT only
+sudo python3 pixiebt.py -m 4 -o hci1 -w ./whispers/ --no-ble
+
+# Audio MITM — generate WAVs from a text file (no pre-existing .wav needed)
+sudo python3 pixiebt.py -m 4 -o hci1 -f words.txt
+
+# Generate WAVs from text + save to specific dir + custom volume
+sudo python3 pixiebt.py -m 4 -o hci1 -f words.txt -w ./my_whispers/ --whisper-volume 0.20
+
+# French whispers (fichier français inclus)
+sudo python3 pixiebt.py -m 4 -l fr -f whispers_fr.txt
+
+# French with 2 adapters for MITM relay
+sudo python3 pixiebt.py -m 4 -o hci1 -l fr -f whispers_fr.txt
 ```
 
 ---
@@ -380,11 +496,22 @@ pixiebt.py
 │   │   └── BLE            : lecc/ledc connection flood
 │   └── Main     : summary loop (15s) → status + intruder list + flood stats
 │
-└── Mode 3 : Capture & Replay
-    ├── _discover_targets()    → scan for non-whitelisted devices
-    ├── _capture_traffic()     → btmon/hcidump capture (1s window)
-    ├── _replay_traffic()      → hcireplay/btmon/hcidump replay (Nx)
-    └── Main loop              → discover → capture → replay (15s cycle)
+├── Mode 3 : Capture & Replay
+│   ├── _discover_targets()    → scan for non-whitelisted devices
+│   ├── _capture_traffic()     → btmon/hcidump capture (1s window)
+│   ├── _replay_traffic()      → hcireplay/btmon/hcidump replay (Nx)
+│   └── Main loop              → discover → capture → replay (15s cycle)
+│
+└── Mode 4 : Audio MITM — Whisper Injection
+    ├── _generate_whispers_from_text() → espeak TTS: text file → .wav (optional)
+    ├── _load_whispers()       → load .wav → resample to 8kHz 16-bit mono
+    ├── _detect_multi_source() → energy + ZCR + CV heuristic (3-signal)
+    ├── _mix_pcm()             → mix whisper into SCO audio with clamping
+    ├── _pair_device()         → bluetoothctl trust + pair
+    ├── _sco_connect()         → AF_BLUETOOTH / BTPROTO_SCO socket
+    ├── _inject_thread()       → single-target: listen + inject on same socket
+    ├── _relay_thread() (×2)   → MITM: A→B and B→A with injection on detection
+    └── Main flow              → [generate] → discover → select 1 or 2 → inject/relay
 ```
 
 ---
@@ -393,7 +520,7 @@ pixiebt.py
 
 ⚠️ **This tool is intended for educational purposes and authorized security testing only.**
 
-Using this tool on Bluetooth devices without explicit authorization is illegal. The L2CAP flood and BLE connection flood features can disrupt Bluetooth communications. Only use this tool on devices you own or for which you have written penetration testing authorization.
+Using this tool on Bluetooth devices without explicit authorization is illegal. The L2CAP flood, BLE connection flood, capture & replay, and audio MITM features can disrupt Bluetooth communications. Intercepting audio between devices may violate wiretapping and privacy laws. Only use this tool on devices you own or for which you have written penetration testing authorization.
 
 ---
 

