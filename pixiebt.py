@@ -7,6 +7,7 @@ import re
 import json
 import time
 import signal
+import shutil
 import argparse
 import subprocess
 import configparser
@@ -55,34 +56,171 @@ def load_config(config_path):
     return iface
 
 
+def _get_controller_mac(iface):
+    """Read the MAC address of an HCI interface from sysfs."""
+    sysfs = "/sys/class/bluetooth/{}/address".format(iface)
+    if os.path.isfile(sysfs):
+        with open(sysfs) as f:
+            return f.read().strip().upper()
+    return None
+
+
+def _list_bt_interfaces():
+    """List available Bluetooth controllers (sysfs, bluetoothctl, hciconfig fallbacks)."""
+    found = []
+    # Method 1: sysfs (most reliable on Linux)
+    bt_dir = "/sys/class/bluetooth"
+    if os.path.isdir(bt_dir):
+        for entry in sorted(os.listdir(bt_dir)):
+            mac = _get_controller_mac(entry) or "??:??:??:??:??:??"
+            found.append((entry, mac))
+    if found:
+        return found
+    # Method 2: bluetoothctl list
+    if shutil.which("bluetoothctl"):
+        try:
+            ret = subprocess.run(
+                ["bluetoothctl", "list"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in ret.stdout.strip().split("\n"):
+                m = re.match(r"Controller\s+([0-9A-Fa-f:]{17})\s+(.*)", line.strip())
+                if m:
+                    found.append((m.group(2).strip() or "controller", m.group(1).upper()))
+        except Exception:
+            pass
+    if found:
+        return found
+    # Method 3: hciconfig -a (legacy)
+    if shutil.which("hciconfig"):
+        try:
+            ret = subprocess.run(
+                ["hciconfig", "-a"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for m in re.finditer(r"(hci\d+)", ret.stdout):
+                found.append((m.group(1), ""))
+        except Exception:
+            pass
+    return found
+
+
+def _btctl_scan(scan_time, quiet=False):
+    """Discover devices using bluetoothctl. Returns {MAC: {name, type}}."""
+    discovered = {}
+    try:
+        proc = subprocess.Popen(
+            ["bluetoothctl", "--timeout", str(scan_time), "scan", "on"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        proc.wait(timeout=scan_time + 10)
+    except Exception:
+        pass
+    try:
+        ret = subprocess.run(
+            ["bluetoothctl", "devices"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in ret.stdout.strip().split("\n"):
+            m = re.match(r"Device\s+([0-9A-Fa-f:]{17})\s+(.*)", line.strip())
+            if m:
+                mac = m.group(1).upper()
+                name = m.group(2).strip() or "<unknown>"
+                if mac not in discovered:
+                    discovered[mac] = {"name": name, "type": "ble"}
+                    if not quiet:
+                        print(colored("      [+] {}: {}".format(mac, name), "green"))
+    except Exception:
+        pass
+    return discovered
+
+
 def check_interface(iface):
-    """Verify that the HCI interface exists and is UP. Offer to bring it up."""
-    ret = subprocess.run(
-        ["hciconfig", iface],
-        capture_output=True, text=True,
-    )
-    if ret.returncode != 0:
-        print(colored("[!] Interface '{}' not found.".format(iface), "red"))
-        print(colored("[!] Available Bluetooth interfaces:", "red"))
-        subprocess.run(["hciconfig", "-a"], check=False)
+    """Verify that the HCI interface exists and is UP. Offer to bring it up.
+    Supports modern bluetoothctl and legacy hciconfig."""
+    use_btctl = shutil.which("bluetoothctl") is not None
+    use_hciconfig = shutil.which("hciconfig") is not None
+
+    if not use_btctl and not use_hciconfig:
+        print(colored("[!] Neither bluetoothctl nor hciconfig found. Install bluez.", "red"))
         sys.exit(1)
 
-    if "UP RUNNING" in ret.stdout:
+    # ── Check existence ──
+    iface_exists = os.path.isdir("/sys/class/bluetooth/" + iface)
+    if not iface_exists and use_hciconfig:
+        ret = subprocess.run(["hciconfig", iface], capture_output=True, text=True)
+        iface_exists = (ret.returncode == 0)
+
+    if not iface_exists:
+        print(colored("[!] Interface '{}' not found.".format(iface), "red"))
+        available = _list_bt_interfaces()
+        if available:
+            print(colored("[!] Available Bluetooth interfaces:", "red"))
+            for name, mac in available:
+                print(colored("      {} ({})".format(name, mac), "white"))
+        else:
+            print(colored("[!] No Bluetooth interfaces detected.", "red"))
+            print(colored("    Check that a Bluetooth adapter is connected and drivers are loaded.", "red"))
+        sys.exit(1)
+
+    # ── Check UP status ──
+    is_up = False
+    if use_btctl:
+        controller_mac = _get_controller_mac(iface)
+        show_args = ["bluetoothctl", "show"]
+        if controller_mac:
+            show_args.append(controller_mac)
+        try:
+            ret = subprocess.run(show_args, capture_output=True, text=True, timeout=5)
+            is_up = "Powered: yes" in ret.stdout
+        except Exception:
+            pass
+    if not is_up and use_hciconfig:
+        try:
+            ret = subprocess.run(["hciconfig", iface], capture_output=True, text=True)
+            is_up = "UP RUNNING" in ret.stdout
+        except Exception:
+            pass
+
+    if is_up:
         print(colored("[+] {} is UP and RUNNING.".format(iface), "green"))
         return
 
+    # ── Bring UP ──
     print(colored("[!] {} is DOWN.".format(iface), "red"))
     answer = input(colored("[?] Bring up {}? [y/N] ".format(iface), "cyan")).strip().lower()
-    if answer == "y":
-        subprocess.run(["hciconfig", iface, "up"], check=False)
-        verify = subprocess.run(["hciconfig", iface], capture_output=True, text=True)
-        if "UP RUNNING" in verify.stdout:
-            print(colored("[+] {} is now UP.".format(iface), "green"))
-        else:
-            print(colored("[!] Failed to bring up {}.".format(iface), "red"))
-            sys.exit(1)
-    else:
+    if answer != "y":
         print(colored("[!] Aborted.", "red"))
+        sys.exit(1)
+
+    if use_btctl:
+        subprocess.run(["bluetoothctl", "power", "on"], capture_output=True, timeout=5)
+    if use_hciconfig:
+        subprocess.run(["hciconfig", iface, "up"], capture_output=True, timeout=5)
+
+    # Verify
+    is_up = False
+    if use_btctl:
+        controller_mac = _get_controller_mac(iface)
+        show_args = ["bluetoothctl", "show"]
+        if controller_mac:
+            show_args.append(controller_mac)
+        try:
+            ret = subprocess.run(show_args, capture_output=True, text=True, timeout=5)
+            is_up = "Powered: yes" in ret.stdout
+        except Exception:
+            pass
+    if not is_up and use_hciconfig:
+        try:
+            ret = subprocess.run(["hciconfig", iface], capture_output=True, text=True)
+            is_up = "UP RUNNING" in ret.stdout
+        except Exception:
+            pass
+
+    if is_up:
+        print(colored("[+] {} is now UP.".format(iface), "green"))
+    else:
+        print(colored("[!] Failed to bring up {}.".format(iface), "red"))
         sys.exit(1)
 
 
@@ -145,7 +283,8 @@ def scan_classic(iface, scan_time=10):
     except subprocess.TimeoutExpired:
         print(colored("    [!] Classic scan timed out.", "yellow"))
     except FileNotFoundError:
-        print(colored("    [!] hcitool not found. Install bluez-tools.", "red"))
+        print(colored("    [!] hcitool not found, falling back to bluetoothctl.", "yellow"))
+        discovered.update(_btctl_scan(scan_time))
     return discovered
 
 
@@ -186,7 +325,8 @@ def scan_ble(iface, scan_time=10):
                 elif name != "<unknown>" and discovered[mac]["name"] == "<unknown>":
                     discovered[mac]["name"] = name
     except FileNotFoundError:
-        print(colored("    [!] hcitool not found. Install bluez.", "red"))
+        print(colored("    [!] hcitool not found, falling back to bluetoothctl.", "yellow"))
+        discovered.update(_btctl_scan(scan_time))
     except Exception as e:
         print(colored("    [!] BLE scan error: {}".format(e), "red"))
 
@@ -484,20 +624,26 @@ def mode_monitor(iface, include_ble=True):
 
     # ── Thread 1: Classic BT inquiry scan ──
     def classic_scan_loop():
+        use_hcitool = shutil.which("hcitool") is not None
         while not stop_event.is_set():
             try:
-                length = max(1, int(8 / 1.28))
-                ret = subprocess.run(
-                    ["hcitool", "-i", iface, "scan", "--flush", "--length", str(length)],
-                    capture_output=True, text=True, timeout=20,
-                )
-                for line in ret.stdout.strip().split("\n"):
-                    line = line.strip()
-                    match = re.match(r"([0-9A-Fa-f:]{17})\s+(.*)", line)
-                    if match:
-                        mac = match.group(1).upper()
-                        name = match.group(2).strip() or "<unknown>"
-                        _check_intruder(mac, name, "classic", "inquiry scan")
+                if use_hcitool:
+                    length = max(1, int(8 / 1.28))
+                    ret = subprocess.run(
+                        ["hcitool", "-i", iface, "scan", "--flush", "--length", str(length)],
+                        capture_output=True, text=True, timeout=20,
+                    )
+                    for line in ret.stdout.strip().split("\n"):
+                        line = line.strip()
+                        match = re.match(r"([0-9A-Fa-f:]{17})\s+(.*)", line)
+                        if match:
+                            mac = match.group(1).upper()
+                            name = match.group(2).strip() or "<unknown>"
+                            _check_intruder(mac, name, "classic", "inquiry scan")
+                else:
+                    devs = _btctl_scan(8, quiet=True)
+                    for mac, info in devs.items():
+                        _check_intruder(mac, info["name"], "classic", "bluetoothctl scan")
                 stats["classic_scans"] += 1
             except subprocess.TimeoutExpired:
                 pass
@@ -507,32 +653,38 @@ def mode_monitor(iface, include_ble=True):
 
     # ── Thread 2: BLE advertisement scan ──
     def ble_scan_loop():
+        use_hcitool = shutil.which("hcitool") is not None
         while not stop_event.is_set():
             if not include_ble:
                 stop_event.wait(60)
                 continue
             try:
-                proc = subprocess.Popen(
-                    ["hcitool", "-i", iface, "lescan", "--duplicates"],
-                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                )
-                time.sleep(8)
-                proc.terminate()
-                try:
-                    remaining, _ = proc.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-                    remaining = ""
-                for line in (remaining or "").strip().split("\n"):
-                    line = line.strip()
-                    match = re.match(r"([0-9A-Fa-f:]{17})\s+(.*)", line)
-                    if match:
-                        mac = match.group(1).upper()
-                        name = match.group(2).strip()
-                        if name in ("(unknown)", ""):
-                            name = "<unknown>"
-                        _check_intruder(mac, name, "ble", "BLE scan")
+                if use_hcitool:
+                    proc = subprocess.Popen(
+                        ["hcitool", "-i", iface, "lescan", "--duplicates"],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                    )
+                    time.sleep(8)
+                    proc.terminate()
+                    try:
+                        remaining, _ = proc.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                        remaining = ""
+                    for line in (remaining or "").strip().split("\n"):
+                        line = line.strip()
+                        match = re.match(r"([0-9A-Fa-f:]{17})\s+(.*)", line)
+                        if match:
+                            mac = match.group(1).upper()
+                            name = match.group(2).strip()
+                            if name in ("(unknown)", ""):
+                                name = "<unknown>"
+                            _check_intruder(mac, name, "ble", "BLE scan")
+                else:
+                    devs = _btctl_scan(8, quiet=True)
+                    for mac, info in devs.items():
+                        _check_intruder(mac, info["name"], "ble", "bluetoothctl BLE scan")
                 stats["ble_scans"] += 1
             except Exception:
                 pass
@@ -542,31 +694,47 @@ def mode_monitor(iface, include_ble=True):
     def connection_monitor():
         """Check active HCI connections. If a connected device is not an
         allowed peer of any of our devices, raise an alert."""
+        use_hcitool = shutil.which("hcitool") is not None
         while not stop_event.is_set():
             try:
-                ret = subprocess.run(
-                    ["hcitool", "-i", iface, "con"],
-                    capture_output=True, text=True, timeout=5,
-                )
-                for line in ret.stdout.split("\n"):
-                    match = re.search(r"([0-9A-Fa-f:]{17})", line)
-                    if match:
-                        mac = match.group(1).upper()
-                        if mac in my_devices:
-                            continue  # it's one of ours
-                        # Check against per-device allowed peers
-                        authorized = False
-                        for dev_mac, dev_info in my_devices.items():
-                            allowed = dev_info.get("allowed_peers", {})
-                            if mac in {p.upper() for p in allowed.keys()}:
-                                authorized = True
-                                break
-                        if not authorized:
-                            _alert_intruder(
-                                mac, "<connected>", "active",
-                                "active connection",
-                                target_device=None,
-                            )
+                connected_macs = []
+                if use_hcitool:
+                    ret = subprocess.run(
+                        ["hcitool", "-i", iface, "con"],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    for line in ret.stdout.split("\n"):
+                        match = re.search(r"([0-9A-Fa-f:]{17})", line)
+                        if match:
+                            connected_macs.append(match.group(1).upper())
+                else:
+                    try:
+                        ret = subprocess.run(
+                            ["bluetoothctl", "devices", "Connected"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        for line in ret.stdout.strip().split("\n"):
+                            match = re.match(r"Device\s+([0-9A-Fa-f:]{17})", line.strip())
+                            if match:
+                                connected_macs.append(match.group(1).upper())
+                    except Exception:
+                        pass
+                for mac in connected_macs:
+                    if mac in my_devices:
+                        continue  # it's one of ours
+                    # Check against per-device allowed peers
+                    authorized = False
+                    for dev_mac, dev_info in my_devices.items():
+                        allowed = dev_info.get("allowed_peers", {})
+                        if mac in {p.upper() for p in allowed.keys()}:
+                            authorized = True
+                            break
+                    if not authorized:
+                        _alert_intruder(
+                            mac, "<connected>", "active",
+                            "active connection",
+                            target_device=None,
+                        )
                 stats["connection_checks"] += 1
             except Exception:
                 pass
