@@ -303,9 +303,9 @@ Injects whispered voices into Bluetooth audio. Supports **SCO** (voice profile) 
 3. **Energy variance** — Coefficient of variation > 15% across 4 sub-windows (dynamic multi-source scene)
 
 **Steps:**
-1. **Generate** *(optional)* — If `-f` is provided (or default `whispers.txt` used), generates WAV files using `espeak-ng`/`espeak` with the `+whisper` voice variant
+1. **Generate** *(optional)* — If `-f` is provided (or default `whispers.txt` / `whispers_{lang}.txt` used), generates WAV files using `espeak-ng`/`espeak` with the `+whisper` voice variant
 2. **Load** — Reads `.wav` files, resamples to 8 kHz 16-bit mono (SCO CVSD)
-3. **Discover** — Scans for all available Bluetooth devices (classic + BLE)
+3. **Discover** — Scans for all available Bluetooth devices (classic + BLE). Uses `hcitool` first, falls back to `bluetoothctl` if no results
 4. **Select** — Interactive selection: **1 target** (direct) or **2 targets** (MITM)
 5. **Disconnect** — Force-disconnects target(s)
 6. **Pair** — `bluetoothctl trust` + `pair`
