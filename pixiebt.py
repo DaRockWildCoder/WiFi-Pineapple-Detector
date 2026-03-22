@@ -1820,10 +1820,14 @@ def mode_whisper(iface, iface2, whispers_dir, whisper_volume=0.15, include_ble=T
 
     # Step 0: Generate WAV from text file (auto-fallback to default)
     if not whispers_text and not whispers_dir:
-        # No explicit source — use default text file
-        whispers_text = WHISPERS_TEXT_FILE
+        # No explicit source — try language-specific file first, then default
+        lang_file = "whispers_{}.txt".format(whisper_lang)
+        if whisper_lang != "en" and os.path.isfile(lang_file):
+            whispers_text = lang_file
+        else:
+            whispers_text = WHISPERS_TEXT_FILE
         print(colored("[*] No --whispers-dir or -f specified", "yellow"))
-        print(colored("[*] Using default: {}".format(WHISPERS_TEXT_FILE), "yellow"))
+        print(colored("[*] Using default: {}".format(whispers_text), "yellow"))
     if whispers_text:
         whispers_dir = _generate_whispers_from_text(whispers_text, whispers_dir, lang=whisper_lang)
         print()
@@ -1885,6 +1889,13 @@ def mode_whisper(iface, iface2, whispers_dir, whisper_volume=0.15, include_ble=T
             except Exception:
                 pass
     else:
+        devs = _btctl_scan(10)
+        for mac, info in devs.items():
+            targets[mac] = info
+
+    # Fallback: if hcitool found nothing, try bluetoothctl
+    if not targets and has_hcitool:
+        print(colored("[*] hcitool returned no results, trying bluetoothctl ...", "yellow"))
         devs = _btctl_scan(10)
         for mac, info in devs.items():
             targets[mac] = info
