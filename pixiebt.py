@@ -78,11 +78,46 @@ def load_config(config_path):
 
 
 def _get_controller_mac(iface):
-    """Read the MAC address of an HCI interface from sysfs."""
+    """Read the MAC address of an HCI interface from sysfs, bluetoothctl, or hciconfig."""
+    # Method 1: sysfs
     sysfs = "/sys/class/bluetooth/{}/address".format(iface)
     if os.path.isfile(sysfs):
         with open(sysfs) as f:
-            return f.read().strip().upper()
+            mac = f.read().strip().upper()
+            if mac and mac != "00:00:00:00:00:00":
+                return mac
+    # Method 2: bluetoothctl show
+    if shutil.which("bluetoothctl"):
+        try:
+            ret = subprocess.run(
+                ["bluetoothctl", "show", iface],
+                capture_output=True, text=True, timeout=5,
+            )
+            # Try "show hci0" first; if it fails, try "show" then grep Controller
+            output = ret.stdout
+            if ret.returncode != 0 or not output.strip():
+                ret = subprocess.run(
+                    ["bluetoothctl", "show"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                output = ret.stdout
+            m = re.search(r"Controller\s+([0-9A-Fa-f:]{17})", output)
+            if m:
+                return m.group(1).upper()
+        except Exception:
+            pass
+    # Method 3: hciconfig (legacy)
+    if shutil.which("hciconfig"):
+        try:
+            ret = subprocess.run(
+                ["hciconfig", iface],
+                capture_output=True, text=True, timeout=5,
+            )
+            m = re.search(r"BD Address:\s*([0-9A-Fa-f:]{17})", ret.stdout)
+            if m:
+                return m.group(1).upper()
+        except Exception:
+            pass
     return None
 
 
