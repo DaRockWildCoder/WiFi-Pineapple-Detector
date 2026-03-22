@@ -321,12 +321,27 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
         sys.exit(1)
 
     whitelist_set = set(b.lower() for b in whitelist.keys())
+    # Also protect VAP siblings of whitelisted BSSIDs (backhaul, guest, etc.)
+    vap_protected = set()
     buf = ReplayBuffer(window=15)
     stop_event = threading.Event()
 
     # Client tracking state (shared with capture thread)
     ap_clients = {}
     clients_lock = threading.Lock()
+
+    def _is_protected(bssid):
+        """Check if a BSSID is whitelisted or a VAP sibling of a whitelisted AP."""
+        if bssid in whitelist_set or bssid in vap_protected:
+            return True
+        # Check if it's a VAP of any whitelisted BSSID
+        for wl_b in whitelist_set:
+            if is_same_ap_vap(bssid, wl_b):
+                vap_protected.add(bssid)
+                print(colored("  [~] VAP protected: {} (sibling of {})".format(
+                    bssid, wl_b), "cyan"))
+                return True
+        return False
 
     def _on_sigint(sig, frame):
         print(colored("\n[*] Stopping ...", "yellow"))
@@ -363,7 +378,7 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
             # ---- Client tracking (real-time) ----
             if pkt.haslayer(Dot11Beacon):
                 bssid = addrs[1]  # addr2
-                if bssid and bssid not in whitelist_set:
+                if bssid and not _is_protected(bssid):
                     try:
                         ssid = pkt.info.decode("utf-8", errors="ignore") or "<hidden>"
                     except Exception:
@@ -376,7 +391,7 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
             else:
                 addr1, addr2, addr3 = addrs
                 bssid, client = None, None
-                if addr3 and addr3 not in whitelist_set and addr3 != "ff:ff:ff:ff:ff:ff":
+                if addr3 and not _is_protected(addr3) and addr3 != "ff:ff:ff:ff:ff:ff":
                     bssid = addr3
                     if addr2 != bssid:
                         client = addr2
@@ -394,8 +409,8 @@ def mode_replay(capture_iface, replay_iface, use_5ghz=False):
                                   colored(" \u2192 ", "yellow") +
                                   colored("{} ({})".format(bssid, ssid), "cyan"))
 
-            # ---- Buffer for replay (exclude whitelisted) ----
-            if not (whitelist_set & set(addrs)):
+            # ---- Buffer for replay (exclude whitelisted + VAP siblings) ----
+            if not any(_is_protected(a) for a in addrs if a):
                 buf.add(pkt, current_channel[0])
 
         while not stop_event.is_set():
@@ -616,6 +631,15 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
     rogue_bssids = set()    # BSSIDs detected as SSID spoofers
     rogue_clients = {}      # rogue_bssid -> {"ssid": str, "clients": set()}
     rogue_lock = threading.Lock()
+    # VAP monitoring: identify backhaul BSSIDs (VAP siblings of whitelisted APs)
+    vap_known = set()           # VAP BSSIDs discovered in mode 1 scan (in whitelist)
+    vap_backhaul = set()        # VAP BSSIDs seen at runtime (hidden, sibling of WL)
+    alerted_backhaul_client = set()  # (backhaul_bssid, client_mac)
+    alerted_backhaul_deauth = set()  # (attacker_mac, target_bssid)
+    alerted_rogue_vap = set()        # (rogue_vap_bssid,)
+    backhaul_client_count = [0]
+    backhaul_deauth_count = [0]
+    rogue_vap_count = [0]
     lock = threading.Lock()
     stop_event = threading.Event()
 
@@ -670,6 +694,55 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                 # Track all beacon BSSIDs for relay detection
                 if bssid not in beacon_bssids:
                     beacon_bssids[bssid] = ssid or "<hidden>"
+
+                # ── VAP Check C: Rogue VAP (MAC in WL range but not whitelisted) ──
+                if bssid not in wl_bssids and bssid not in vap_backhaul:
+                    is_vap_sibling = any(is_same_ap_vap(bssid, wl_b) for wl_b in wl_bssids)
+                    if is_vap_sibling:
+                        if ssid and ssid != "<hidden>":
+                            # Known SSID broadcast from VAP-range MAC not in whitelist
+                            # Check if SSID matches a whitelisted one → rogue VAP
+                            if ssid_lower in wl_ssids:
+                                alert_key = (bssid,)
+                                if alert_key not in alerted_rogue_vap:
+                                    alerted_rogue_vap.add(alert_key)
+                                    rogue_vap_count[0] += 1
+                                    rogue_bssids.add(bssid)
+                                    parent = [wl_b for wl_b in wl_bssids if is_same_ap_vap(bssid, wl_b)]
+                                    print(colored(
+                                        "\n  [!!!] ROGUE VAP DETECTED",
+                                        "red", attrs=["bold", "reverse"]))
+                                    print(colored(
+                                        "        Rogue VAP BSSID : {}".format(bssid),
+                                        "red", attrs=["bold"]))
+                                    print(colored(
+                                        "        SSID            : {}".format(ssid),
+                                        "red", attrs=["bold"]))
+                                    print(colored(
+                                        "        MAC sibling of  : {}".format(", ".join(parent)),
+                                        "green"))
+                                    print(colored(
+                                        "        Channel         : {}".format(ch),
+                                        "yellow"))
+                                    print(colored(
+                                        "        Time            : {}".format(time.strftime("%c")),
+                                        "yellow"))
+                                    print(colored(
+                                        "        [>>>] COUNTER-OFFENSIVE ENGAGED",
+                                        "red", attrs=["bold"]))
+                                    print()
+                            else:
+                                # Hidden or different SSID → legitimate backhaul VAP
+                                vap_backhaul.add(bssid)
+                                print(colored(
+                                    "  [~] Backhaul VAP discovered: {} ({}) — sibling protected".format(
+                                        bssid, ssid or "<hidden>"), "cyan"))
+                        else:
+                            # Hidden SSID + VAP range → backhaul
+                            vap_backhaul.add(bssid)
+                            print(colored(
+                                "  [~] Backhaul VAP discovered: {} (hidden) — sibling protected".format(
+                                    bssid), "cyan"))
 
                 # ── Check 1: SSID spoofing ──
                 if ssid_lower in wl_ssids and bssid not in wl_bssids:
@@ -737,6 +810,42 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
             addr2 = (dot11.addr2 or "").lower()
             addr3 = (dot11.addr3 or "").lower()
 
+            # ── VAP Check A: Deauth targeting a whitelisted or backhaul BSSID ──
+            if pkt.haslayer(Dot11Deauth):
+                protected = wl_bssids | vap_backhaul
+                target_bh = None
+                attacker = None
+                # Deauth frame: addr1=destination, addr2=source, addr3=BSSID
+                if addr1 in protected:
+                    target_bh = addr1
+                    attacker = addr2
+                elif addr3 in protected and addr1 not in protected:
+                    target_bh = addr3
+                    attacker = addr2
+                if target_bh and attacker and attacker not in protected:
+                    with lock:
+                        alert_key = (attacker, target_bh)
+                        if alert_key not in alerted_backhaul_deauth:
+                            alerted_backhaul_deauth.add(alert_key)
+                            backhaul_deauth_count[0] += 1
+                            t_ssid = beacon_bssids.get(target_bh, "<backhaul>")
+                            print(colored(
+                                "\n  [!!!] DEAUTH ATTACK ON PROTECTED BSSID",
+                                "red", attrs=["bold", "reverse"]))
+                            print(colored(
+                                "        Target BSSID : {} ({})".format(target_bh, t_ssid),
+                                "red", attrs=["bold"]))
+                            print(colored(
+                                "        Attacker MAC : {}".format(attacker),
+                                "red", attrs=["bold"]))
+                            print(colored(
+                                "        Channel      : {}".format(current_channel[0]),
+                                "yellow"))
+                            print(colored(
+                                "        Time         : {}".format(time.strftime("%c")),
+                                "yellow"))
+                            print()
+
             with lock:
                 target_bssid = None
                 client_mac = None
@@ -770,6 +879,39 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
             # ── Relay/repeater detection (data frames only) ──
             if dot11.type == 2:
                 ds_bits = dot11.FCfield & 0x3
+
+                # ── VAP Check B: Unknown client on backhaul BSSID ──
+                # A backhaul VAP should only talk to pod BSSIDs, never to random clients
+                if addr3 in vap_backhaul or addr1 in vap_backhaul:
+                    bh_bssid = addr3 if addr3 in vap_backhaul else addr1
+                    suspect = addr2 if addr2 != bh_bssid else addr1
+                    if (suspect and suspect != "ff:ff:ff:ff:ff:ff"
+                            and suspect != bh_bssid
+                            and suspect not in wl_bssids
+                            and suspect not in vap_backhaul
+                            and not is_same_ap_vap(suspect, bh_bssid)):
+                        with lock:
+                            alert_key = (bh_bssid, suspect)
+                            if alert_key not in alerted_backhaul_client:
+                                alerted_backhaul_client.add(alert_key)
+                                backhaul_client_count[0] += 1
+                                bh_ssid = beacon_bssids.get(bh_bssid, "<backhaul>")
+                                print(colored(
+                                    "\n  [!!!] UNKNOWN CLIENT ON BACKHAUL",
+                                    "yellow", attrs=["bold", "reverse"]))
+                                print(colored(
+                                    "        Backhaul BSSID: {} ({})".format(bh_bssid, bh_ssid),
+                                    "yellow", attrs=["bold"]))
+                                print(colored(
+                                    "        Client MAC    : {}".format(suspect),
+                                    "red", attrs=["bold"]))
+                                print(colored(
+                                    "        Channel       : {}".format(current_channel[0]),
+                                    "yellow"))
+                                print(colored(
+                                    "        Time          : {}".format(time.strftime("%c")),
+                                    "yellow"))
+                                print()
 
                 with lock:
                     relay_bssid = None
@@ -926,6 +1068,23 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                 spoof_count, clone_count, relay_count),
             "yellow" if total_alerts == 0 else "red",
         ))
+        # VAP monitoring summary
+        with lock:
+            bh_clients = backhaul_client_count[0]
+            bh_deauths = backhaul_deauth_count[0]
+            r_vaps = rogue_vap_count[0]
+            bh_set = set(vap_backhaul)
+        if bh_set or bh_clients or bh_deauths or r_vaps:
+            print(colored(
+                "[*] VAP monitor: {} backhaul(s) tracked, {} unknown client(s), {} deauth attack(s), {} rogue VAP(s)".format(
+                    len(bh_set), bh_clients, bh_deauths, r_vaps),
+                "cyan" if (bh_deauths == 0 and r_vaps == 0) else "red",
+            ))
+            if bh_set:
+                print(colored("    Protected backhaul VAPs:", "cyan"))
+                for b in sorted(bh_set):
+                    b_ssid = bssid_names.get(b, "<hidden>")
+                    print(colored("      └─ {} ({})".format(b, b_ssid), "white"))
         if rogue_count:
             print(colored(
                 "[*] Counter-offensive: {} rogue AP(s), {} client(s) under deauth + latency".format(
