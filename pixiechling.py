@@ -51,6 +51,18 @@ def get_ds_channel(pkt):
     return None
 
 
+def is_same_ap_vap(mac1, mac2, max_offset=4):
+    """Return True if mac1 and mac2 are likely VAPs of the same physical AP.
+    Mesh/repeater systems derive backhaul & guest BSSIDs by incrementing the
+    last byte(s) of the base radio MAC, typically by 1-4."""
+    try:
+        b1 = int(mac1.replace(":", ""), 16)
+        b2 = int(mac2.replace(":", ""), 16)
+        return abs(b1 - b2) <= max_offset
+    except (ValueError, AttributeError):
+        return False
+
+
 DESCRIPTION = """
 Pixiechling - WiFi Traffic Capture & Replay Tool
 
@@ -193,6 +205,38 @@ def mode_scan_whitelist(capture_iface, scan_time=30, use_5ghz=False):
     if not discovered:
         print(colored("[!] No BSSIDs found. Make sure the interface is in monitor mode.", "red"))
         return
+
+    # Detect VAP groups (BSSIDs from the same physical AP)
+    bssid_keys = sorted(discovered.keys())
+    vap_groups = []  # list of sets
+    assigned = set()
+    for i, b1 in enumerate(bssid_keys):
+        if b1 in assigned:
+            continue
+        group = {b1}
+        for b2 in bssid_keys[i + 1:]:
+            if b2 in assigned:
+                continue
+            if is_same_ap_vap(b1, b2):
+                group.add(b2)
+        if len(group) > 1:
+            vap_groups.append(group)
+            assigned.update(group)
+
+    if vap_groups:
+        print(colored("\n[*] VAP groups detected (same physical AP):", "cyan"))
+        for gidx, group in enumerate(vap_groups, start=1):
+            members = sorted(group)
+            base = members[0]
+            base_info = discovered[base]
+            print(colored("    Group {} — base: {} ({})".format(
+                gidx, base, base_info["ssid"]), "cyan"))
+            for m in members[1:]:
+                m_info = discovered[m]
+                label = m_info["ssid"] if m_info["ssid"] != "<hidden>" else "backhaul/internal"
+                print(colored("      └─ VAP: {} ({})".format(m, label), "white"))
+    else:
+        print(colored("\n[*] No VAP groups detected.", "cyan"))
 
     # Display table
     bssid_list = sorted(discovered.items(), key=lambda x: x[1]["ssid"])
@@ -629,26 +673,31 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
 
                 # ── Check 1: SSID spoofing ──
                 if ssid_lower in wl_ssids and bssid not in wl_bssids:
-                    alert_key = (bssid, ssid_lower)
-                    if alert_key not in alerted_spoof:
-                        alerted_spoof.add(alert_key)
-                        rogue_bssids.add(bssid)
-                        legit = ", ".join(wl_ssids[ssid_lower])
-                        print(colored(
-                            "\n  [!!!] SSID SPOOFING DETECTED", "red", attrs=["bold", "reverse"]))
-                        print(colored(
-                            "        Rogue BSSID : {}".format(bssid), "red", attrs=["bold"]))
-                        print(colored(
-                            "        Spoofed SSID: {}".format(ssid), "red", attrs=["bold"]))
-                        print(colored(
-                            "        Legit BSSID : {}".format(legit), "green"))
-                        print(colored(
-                            "        Channel     : {}".format(ch), "yellow"))
-                        print(colored(
-                            "        Time        : {}".format(time.strftime("%c")), "yellow"))
-                        print(colored(
-                            "        [>>>] COUNTER-OFFENSIVE ENGAGED", "red", attrs=["bold"]))
-                        print()
+                    # Skip if this BSSID is a VAP sibling of a whitelisted AP
+                    is_vap = any(is_same_ap_vap(bssid, wl_b) for wl_b in wl_ssids[ssid_lower])
+                    if is_vap:
+                        pass  # Same physical AP — not a spoof
+                    else:
+                        alert_key = (bssid, ssid_lower)
+                        if alert_key not in alerted_spoof:
+                            alerted_spoof.add(alert_key)
+                            rogue_bssids.add(bssid)
+                            legit = ", ".join(wl_ssids[ssid_lower])
+                            print(colored(
+                                "\n  [!!!] SSID SPOOFING DETECTED", "red", attrs=["bold", "reverse"]))
+                            print(colored(
+                                "        Rogue BSSID : {}".format(bssid), "red", attrs=["bold"]))
+                            print(colored(
+                                "        Spoofed SSID: {}".format(ssid), "red", attrs=["bold"]))
+                            print(colored(
+                                "        Legit BSSID : {}".format(legit), "green"))
+                            print(colored(
+                                "        Channel     : {}".format(ch), "yellow"))
+                            print(colored(
+                                "        Time        : {}".format(time.strftime("%c")), "yellow"))
+                            print(colored(
+                                "        [>>>] COUNTER-OFFENSIVE ENGAGED", "red", attrs=["bold"]))
+                            print()
                 # \u2500\u2500 Check 2: BSSID cloning \u2500\u2500
                 if bssid in wl_bssids:
                     expected_ch = wl_channels.get(bssid)
@@ -741,33 +790,37 @@ def mode_rogue_detect(capture_iface, replay_iface, use_5ghz=False):
                             upstream_bssid = addr1
 
                     if relay_bssid and upstream_bssid:
-                        alert_key = (relay_bssid, upstream_bssid)
-                        if alert_key not in alerted_relay:
-                            alerted_relay.add(alert_key)
-                            if relay_bssid not in relays:
-                                relays[relay_bssid] = {}
-                            relays[relay_bssid][upstream_bssid] = beacon_bssids.get(
-                                upstream_bssid, "<unknown>")
+                        # Skip VAP siblings (same physical AP, MAC offset ≤ 4)
+                        if is_same_ap_vap(relay_bssid, upstream_bssid):
+                            pass
+                        else:
+                            alert_key = (relay_bssid, upstream_bssid)
+                            if alert_key not in alerted_relay:
+                                alerted_relay.add(alert_key)
+                                if relay_bssid not in relays:
+                                    relays[relay_bssid] = {}
+                                relays[relay_bssid][upstream_bssid] = beacon_bssids.get(
+                                    upstream_bssid, "<unknown>")
 
-                            r_ssid = beacon_bssids.get(relay_bssid, "<unknown>")
-                            u_ssid = beacon_bssids.get(upstream_bssid, "<unknown>")
-                            print(colored(
-                                "\n  [!!!] SIGNAL RELAY / REPEATER DETECTED",
-                                "magenta", attrs=["bold", "reverse"]))
-                            print(colored(
-                                "        Relay BSSID   : {} ({})".format(
-                                    relay_bssid, r_ssid), "magenta", attrs=["bold"]))
-                            print(colored(
-                                "        Upstream BSSID: {} ({})".format(
-                                    upstream_bssid, u_ssid), "cyan", attrs=["bold"]))
-                            print(colored(
-                                "        Channel       : {}".format(
-                                    current_channel[0]), "yellow"))
-                            print(colored(
-                                "        Time          : {}".format(
-                                    time.strftime("%c")), "yellow"))
-                            print()
-                            _save_relays()
+                                r_ssid = beacon_bssids.get(relay_bssid, "<unknown>")
+                                u_ssid = beacon_bssids.get(upstream_bssid, "<unknown>")
+                                print(colored(
+                                    "\n  [!!!] SIGNAL RELAY / REPEATER DETECTED",
+                                    "magenta", attrs=["bold", "reverse"]))
+                                print(colored(
+                                    "        Relay BSSID   : {} ({})".format(
+                                        relay_bssid, r_ssid), "magenta", attrs=["bold"]))
+                                print(colored(
+                                    "        Upstream BSSID: {} ({})".format(
+                                        upstream_bssid, u_ssid), "cyan", attrs=["bold"]))
+                                print(colored(
+                                    "        Channel       : {}".format(
+                                        current_channel[0]), "yellow"))
+                                print(colored(
+                                    "        Time          : {}".format(
+                                        time.strftime("%c")), "yellow"))
+                                print()
+                                _save_relays()
 
     # ── Capture thread ──
     def capture_loop():
