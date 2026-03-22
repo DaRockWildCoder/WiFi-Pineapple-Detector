@@ -1,0 +1,8 @@
+# PixieBT Mode 4 — Liste de mots pour injection de chuchotements
+# Un mot ou phrase par ligne — chaque ligne génère un .wav chuchoté via espeak
+# Les lignes commençant par # sont ignorées
+# Utiliser avec: -l fr -f whispers_fr.txt
+
+termine tes devoirs
+ferme youtube
+brosse tes dents
