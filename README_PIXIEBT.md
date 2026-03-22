@@ -25,6 +25,7 @@ Key concept: a **two-level whitelist** defines which devices are yours, and whic
 - [Usage Modes](#usage-modes)
   - [Mode 1 — Scan & Whitelist](#mode-1--scan--whitelist)
   - [Mode 2 — Monitor & Counter-Offensive](#mode-2--monitor--counter-offensive)
+  - [Mode 3 — Capture & Replay](#mode-3--capture--replay)
 - [CLI Options](#cli-options)
 - [Generated Files](#generated-files)
 - [Examples](#examples)
@@ -54,6 +55,9 @@ pip3 install termcolor
 | `hcitool` | `bluez` | Scanning (inquiry, lescan, connections) |
 | `l2ping` | `bluez` | L2CAP flood counter-offensive |
 | `bluetoothctl` | `bluez` | BLE device discovery (fallback) |
+| `btmon` | `bluez` | HCI traffic capture & replay (mode 3) |
+| `hcidump` | `bluez` | HCI traffic capture (fallback for btmon) |
+| `hcireplay` | `bluez` | HCI replay (optional, preferred for mode 3) |
 
 ```bash
 # Debian/Ubuntu
@@ -221,18 +225,70 @@ sudo python3 pixiebt.py -m 2
 
 ---
 
+### Mode 3 — Capture & Replay
+
+Scans for non-whitelisted Bluetooth devices, captures 1 second of HCI traffic, then replays the capture a configurable number of times (default: 10x).
+
+```bash
+sudo python3 pixiebt.py -m 3
+sudo python3 pixiebt.py -m 3 -r 20    # replay 20x instead of 10
+```
+
+**How it works:**
+
+1. **Discovery** — Scans for Classic BT + BLE devices not in the whitelist
+2. **Capture** — For each target, records 1 second of HCI traffic using `btmon` (or `hcidump`)
+3. **Replay** — Replays the captured traffic N times using `hcireplay` / `btmon -r` / `hcidump -r`
+4. **Loop** — Repeats every 15 seconds with a fresh scan
+
+**Capture & Replay tools (priority order):**
+
+| Step | Tool | Fallback |
+|------|------|----------|
+| Capture | `btmon -w` | `hcidump -w` |
+| Replay | `hcireplay` | `btmon -r` → `hcidump -r` |
+
+**Alert example:**
+
+```
+[─] Scan cycle 1 ...
+    [*] 2 non-whitelisted device(s) found:
+        77:88:99:AA:BB:CC (UnknownSpeaker) [classic]
+        DD:EE:FF:00:11:22 (<unknown>) [ble]
+
+  [▶] TARGET: 77:88:99:AA:BB:CC (UnknownSpeaker)
+    [*] Capturing 1 s of traffic ...
+    [+] Captured 1842 bytes → /tmp/pixiebt_captures/cap_778899AABBCC_1711108200.bin
+    [*] Replaying 10x ...
+    [+] Replayed 10/10 times
+
+  [▶] TARGET: DD:EE:FF:00:11:22 (<unknown>)
+    [*] Capturing 1 s of traffic ...
+    [!] No traffic captured, skipping.
+
+[*] Cycle 1 complete — 1 capture(s), 10 replay(s), 1 target(s)
+```
+
+**Captures** are saved in `/tmp/pixiebt_captures/`.
+
+> ⚠️ **Whitelist required**: Run mode 1 first.
+> ⚠️ **btmon or hcidump required**: Install `bluez` package.
+
+---
+
 ## CLI Options
 
 ```
-usage: PixieBT [-h] -m {1,2} [-c CONFIG] [-t SCAN_TIME] [--no-ble]
+usage: PixieBT [-h] -m {1,2,3} [-c CONFIG] [-t SCAN_TIME] [-r REPLAY_COUNT] [--no-ble]
 ```
 
 | Option | Long | Description | Default | Modes |
 |--------|------|-------------|---------|-------|
-| `-m` | `--mode` | Execution mode (1 or 2) | *required* | all |
+| `-m` | `--mode` | Execution mode (1, 2 or 3) | *required* | all |
 | `-c` | `--config` | Path to configuration file | `pixiebt.conf` | all |
 | `-t` | `--scan-time` | Scan duration in seconds | `10` | 1 |
-| | `--no-ble` | Disable BLE scanning (Classic BT only) | `false` | 1, 2 |
+| `-r` | `--replay-count` | Number of times to replay captured traffic | `10` | 3 |
+| | `--no-ble` | Disable BLE scanning (Classic BT only) | `false` | 1, 2, 3 |
 
 ---
 
@@ -290,6 +346,15 @@ sudo python3 pixiebt.py -m 2
 # Monitor without BLE
 sudo python3 pixiebt.py -m 2 --no-ble
 
+# Capture & replay (10x, default)
+sudo python3 pixiebt.py -m 3
+
+# Capture & replay 20x
+sudo python3 pixiebt.py -m 3 -r 20
+
+# Capture & replay, classic BT only
+sudo python3 pixiebt.py -m 3 --no-ble
+
 # With a custom config file
 sudo python3 pixiebt.py -m 2 -c /etc/pixiebt/custom.conf
 ```
@@ -306,14 +371,20 @@ pixiebt.py
 │   ├── scan_all()              → combined scan
 │   └── mode_scan_whitelist()   → interactive device selection UI
 │
-└── Mode 2 : Monitor & Counter-Offensive
-    ├── Thread 1 : classic_scan_loop()   → periodic Classic BT inquiry (30s)
-    ├── Thread 2 : ble_scan_loop()       → periodic BLE scan (15s)
-    ├── Thread 3 : connection_monitor()  → active connection check (5s)
-    ├── Thread 4 : counter_loop()        → counter-offensive dispatch
-    │   ├── Classic/Active : l2ping flood + name request spam
-    │   └── BLE            : lecc/ledc connection flood
-    └── Main     : summary loop (15s) → status + intruder list + flood stats
+├── Mode 2 : Monitor & Counter-Offensive
+│   ├── Thread 1 : classic_scan_loop()   → periodic Classic BT inquiry (30s)
+│   ├── Thread 2 : ble_scan_loop()       → periodic BLE scan (15s)
+│   ├── Thread 3 : connection_monitor()  → active connection check (5s)
+│   ├── Thread 4 : counter_loop()        → counter-offensive dispatch
+│   │   ├── Classic/Active : l2ping flood + name request spam
+│   │   └── BLE            : lecc/ledc connection flood
+│   └── Main     : summary loop (15s) → status + intruder list + flood stats
+│
+└── Mode 3 : Capture & Replay
+    ├── _discover_targets()    → scan for non-whitelisted devices
+    ├── _capture_traffic()     → btmon/hcidump capture (1s window)
+    ├── _replay_traffic()      → hcireplay/btmon/hcidump replay (Nx)
+    └── Main loop              → discover → capture → replay (15s cycle)
 ```
 
 ---
